@@ -1,0 +1,5 @@
+{
+  "name": "Live Stream",
+  "description": "Continuous voice streaming, Gemini Live style animated soundwaves, live translucent silver overlay, progress speech updates, and barge-in trajectory redirection for OpenCode Web.",
+  "script": "./dist/plugin.js"
+}

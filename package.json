@@ -1,0 +1,32 @@
+{
+  "name": "opencode-web-stream-plugin",
+  "version": "0.1.0",
+  "description": "Continuous voice streaming and live translucent silver overlay with barge-in for OpenCode Web via Lens.",
+  "keywords": [
+    "opencode",
+    "opencode-lens",
+    "opencode-web",
+    "live-stream",
+    "soundwaves",
+    "barge-in"
+  ],
+  "license": "MIT",
+  "author": "KπX",
+  "type": "module",
+  "exports": {
+    ".": "./lens.plugin.json",
+    "./plugin": "./dist/plugin.js"
+  },
+  "scripts": {
+    "build": "pnpm run clean && tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "latest"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.7.0"
+}
