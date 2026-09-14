@@ -3,11 +3,15 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
     "strict": true,
+    "noUncheckedIndexedAccess": false,
     "skipLibCheck": true,
+    "declaration": false,
+    "sourceMap": true,
     "outDir": "./dist",
     "rootDir": "./src"
   },
-  "include": ["src/**/*"]
+  "include": ["src/daemon/**/*", "src/shared/**/*", "src/types/**/*"]
 }
