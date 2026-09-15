@@ -60,11 +60,14 @@ cp agent/streamer.md ~/.config/opencode/agents/streamer.md
 npm start
 ```
 
-Point opencode-lens at `dist/plugin.js` and proxy `/__stream__` and `/ws/stream`
-to the daemon. Speech runs through any OpenAI-compatible transcription and
-synthesis endpoint; with none configured, the browser's own voice and
-recognition take over. Setup for a local, fully offline stack is in
-[AGENTS.md, section 10](AGENTS.md#10-local-setup-on-the-workstation).
+Register `lens.plugin.json` with opencode-lens and proxy `/__stream__` and
+`/ws/stream` to the daemon. Lens reads the bundle once at startup, so every
+cockpit deploy is `npm run build && systemctl --user restart opencode-lens`.
+
+Speech runs through any OpenAI-compatible transcription and synthesis endpoint;
+with none configured, the browser's own voice and recognition take over. The
+ordered runbook, with a verification step after each piece and a symptom table,
+is [AGENTS.md, section 10](AGENTS.md#10-deploying-on-the-workstation).
 
 ## Develop
 

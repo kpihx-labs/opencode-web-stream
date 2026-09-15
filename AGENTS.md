@@ -332,11 +332,26 @@ When you add behaviour:
 
 ---
 
-## 10. Local setup on the workstation
+## 10. Deploying on the workstation
 
-Everything below runs on the machine; nothing leaves it.
+Everything below runs on the machine; nothing leaves it. Four pieces have to
+agree: the daemon, the Lens proxy, the speech engines, and the streamer agent.
+Do them in this order, and verify each one before moving on — both deployment
+failures so far were a piece that looked deployed and was not.
 
-### 10.1 Service
+### 10.1 Build
+
+```bash
+cd ~/.agents/skills/k-opencode/scripts/plugins/web/opencode-web-stream
+npm ci          # or pnpm install --frozen-lockfile
+npm run build   # writes dist/daemon/** and dist/plugin.js
+npm test        # optional, ~5 s, no network or microphone needed
+```
+
+`dist/` is not committed, so this step is mandatory on every machine and after
+every pull.
+
+### 10.2 The daemon
 
 ```ini
 # ~/.config/systemd/user/opencode-web-stream.service
@@ -358,42 +373,66 @@ RestartSec=3
 WantedBy=default.target
 ```
 
+`ExecStart` needs an absolute interpreter path (`which node`) because a user
+unit does not load the shell profile, so a version manager's `node` is not on
+its `PATH`. `OPENCODE_URL` must be the port `opencode serve` actually listens
+on — the same one Lens proxies to.
+
 ```bash
-npm ci && npm run build
 systemctl --user daemon-reload
 systemctl --user enable --now opencode-web-stream
 ```
 
-### 10.2 Lens
+**Verify** before going further:
+
+```bash
+curl -s localhost:8765/health | jq
+# { "status": "ok", "opencode": true, ... }  ← opencode:true means the event stream is connected
+```
+
+`opencode: false` means the daemon is up but cannot reach OpenCode: check
+`OPENCODE_URL`.
+
+### 10.3 The Lens proxy
 
 The cockpit only ever talks to its own origin: HTTP under `/__stream__/` and a
-WebSocket at `/ws/stream`. The Lens proxy already bridges both to the daemon,
-so the Tailscale HTTPS name works with no extra configuration.
+WebSocket at `/ws/stream`. The Lens proxy bridges both to the daemon, which is
+why the Tailscale HTTPS name works with no extra configuration.
 
-`lens/lens-proxy.mjs` is that proxy with one change: the daemon's address is
-read from `OPENCODE_WEB_STREAM_TARGET` (default `http://127.0.0.1:8765`)
-instead of being written twice in the file. Copy it over
-`opencode-lens/scripts/lens-proxy.mjs`; nothing else in it moved, so the other
-plugins are unaffected.
+`lens/lens-proxy.mjs` is the proxy already in service with one change: the
+daemon address is read from `OPENCODE_WEB_STREAM_TARGET` (default
+`http://127.0.0.1:8765`) instead of being written twice in the file. Copy it
+over `opencode-lens/scripts/lens-proxy.mjs`; nothing else in it moved, so the
+other plugins are unaffected.
 
-Register the plugin through the manifest, alongside the others, in the
-comma-separated `OPENCODE_WEB_PLUGINS` of the `opencode-lens` unit:
+Register the plugin alongside the others in the comma-separated
+`OPENCODE_WEB_PLUGINS` of the `opencode-lens` unit, pointing at the **manifest**,
+not at the bundle:
 
 ```ini
 Environment="OPENCODE_WEB_PLUGINS=…/opencode-web-voice/lens.plugin.json,…/opencode-web-stream/lens.plugin.json"
 ```
 
-The manifest points at `dist/plugin.js`, which Lens reads **once at startup**
-and keeps in memory. A rebuild alone therefore changes nothing in the browser:
+> **Lens reads the bundle once, at startup, and keeps it in memory.** A rebuild
+> alone changes nothing in the browser: the proxy keeps serving the previous
+> code, which makes a fixed bug look unfixed. Every deploy of the cockpit is
+> therefore two commands, never one:
+>
+> ```bash
+> npm run build && systemctl --user restart opencode-lens
+> ```
+
+**Verify**, from the browser, on the Tailscale address:
 
 ```bash
-npm run build && systemctl --user restart opencode-lens
+curl -sk https://kpihx-ubuntu.tail2527bd.ts.net:2443/__stream__/health | jq
 ```
 
-Reloading the page without restarting the proxy serves the previous bundle,
-which makes a fixed bug look unfixed.
+Then open the page and look for the waveform button in the composer's action
+row. If it is missing, the bundle was not injected: check the manifest path and
+restart Lens.
 
-### 10.3 Speech engines
+### 10.4 Speech engines
 
 Any OpenAI-compatible endpoint works. On an Intel Arc integrated GPU with 32 GB
 of shared memory, [speaches](https://github.com/speaches-ai/speaches) serves
@@ -412,8 +451,8 @@ curl -s -X POST localhost:8000/v1/models/speaches-ai/Kokoro-82M-v1.0-ONNX
 
 Defaults in `config.ts` already point at `127.0.0.1:8000` with
 `Systran/faster-whisper-large-v3`, Whisper language detection on, the French
-Kokoro voice `ff_siwis` and the English one `af_heart`.
-Override per machine in `~/.config/opencode-web-stream/config.json`:
+Kokoro voice `ff_siwis` and the English one `af_heart`. Override per machine in
+`~/.config/opencode-web-stream/config.json`:
 
 ```json
 {
@@ -423,6 +462,17 @@ Override per machine in `~/.config/opencode-web-stream/config.json`:
   "tts": { "url": "http://127.0.0.1:8000/v1/audio/speech", "model": "speaches-ai/Kokoro-82M-v1.0-ONNX", "voices": { "fr": "ff_siwis", "en": "af_heart" }, "voice": "ff_siwis", "speed": 1.05 },
   "streamer": { "model": "opencode-go/muse-spark-1.3-contributor" }
 }
+```
+
+The config file is read at startup, so `systemctl --user restart
+opencode-web-stream` after editing it.
+
+**Verify** that the daemon found both engines:
+
+```bash
+curl -s localhost:8765/api/status | jq '{stt: .stt, tts: .tts, speech: .speech}'
+# engine "server" on both means local speech; "browser" means the daemon could
+# not reach the endpoint and the cockpit will use the browser's own voice.
 ```
 
 Notes for this hardware:
@@ -436,17 +486,47 @@ Notes for this hardware:
   than the voice.
 - The Arc iGPU helps through OpenVINO; the CPU image is the reliable starting
   point and the one the defaults assume.
-- Set both endpoints to `""` in the config to disable server speech entirely:
-  the cockpit then uses the browser's own recognition and synthesis, with no
-  other change.
+- Set both endpoints to `""` to disable server speech entirely: the cockpit
+  then uses the browser's own recognition and synthesis, with no other change.
 
-### 10.4 Agent
+### 10.5 The streamer agent
+
+Copy the prompt into the agents directory OpenCode reads, **naming the file
+after the agent**. Which directory that is depends on the layout:
 
 ```bash
+# Standard OpenCode layout, one file per agent:
 cp agent/streamer.md ~/.config/opencode/agents/streamer.md
+
+# A custom agents root (OPENCODE_CONFIG / a directory of folders per agent):
+cp agent/streamer.md ~/.agents/agents/streamer/agent.md
 ```
 
-The filename is the agent name. OpenCode loads `~/.config/opencode/AGENTS.md`
-and the project's `AGENTS.md` into every agent, streamer included — keep global
-rules about *how to do work* scoped so they do not confuse a subagent whose only
-job is to speak.
+Either shape works; what matters is that the agent ends up named `streamer`,
+matching `streamer.agent` in the daemon's config. OpenCode also loads the
+global `AGENTS.md` and the project's into every agent, the streamer included —
+keep global rules about *how to do work* scoped, so they do not confuse a
+subagent whose only job is to speak.
+
+**Verify** end to end: open a session, click the waveform button, say something
+short. The transcript strip should show what was heard. Then:
+
+```bash
+journalctl --user -u opencode-web-stream -f -o cat | jq -c '{scope, msg}'
+```
+
+A working voice turn logs `live on`, `streamer session created`, then
+`streamer decided`.
+
+### 10.6 When something misbehaves
+
+| Symptom | Likely cause | Check |
+| --- | --- | --- |
+| The tab freezes on load | An old bundle is being served | `systemctl --user restart opencode-lens` after every build |
+| No button in the composer | The plugin is not registered, or Lens was not restarted | `OPENCODE_WEB_PLUGINS` points at `lens.plugin.json`, then restart Lens |
+| The button is greyed out | The daemon is unreachable from the browser | `curl …/__stream__/health` through the proxy, not just on localhost |
+| "Je ne sais pas dans quel dossier travailler" | The page has no workspace in its URL | Open a project first; the new-session page carries the directory, the bare root does not |
+| Nothing is spoken, no errors | The streamer agent is not installed under that name | `streamer` must exist as an agent; the daemon logs `streamer request failed` otherwise |
+| A robotic browser voice instead of the local one | The daemon cannot reach the TTS endpoint | `/api/status` shows `tts.engine: "browser"` |
+| Words are transcribed but never acted on | The streamer answered off-format | `journalctl … \| jq 'select(.msg=="streamer decided")'` shows what it returned |
+| Everything works, then goes silent | Live was toggled off, or the session changed | `/api/status` lists the live sessions |
