@@ -11,7 +11,7 @@ import type {
 } from "../../shared/opencode-events.js";
 import { isTextPart, isToolPart } from "../../shared/opencode-events.js";
 import type { ControlAction, LiveState, ServerMessage, SessionSnapshot, SpeechKind, Utterance } from "../../shared/protocol.js";
-import type { Config } from "../config.js";
+import { shortLang, type Config } from "../config.js";
 import type { Logger, ScopedLogger } from "../log.js";
 import { buildLexicon, type Lexicon } from "../lexicon/build.js";
 import { candidatesFor, renderLexiconContext, topPhrases } from "../lexicon/match.js";
@@ -75,6 +75,8 @@ export type Session = {
   lastSpoken?: string;
   lastHeard?: { raw: string; corrected: string };
   prefs: { digest: boolean; muted: boolean };
+  /** Two-letter code of the language the user last spoke in. */
+  lang: string;
   userMessages: Set<string>;
   partTypes: Map<string, string>;
   streamer?: StreamerSession;
@@ -147,6 +149,7 @@ export class Orchestrator {
         (beat) => this.onBeat(beat),
       ),
       prefs: { digest: prefs.digest ?? this.cfg.answer.mode === "digest", muted: prefs.muted ?? false },
+      lang: this.registry.prefs(id).lang ?? this.cfg.speech.default,
       userMessages: new Set(),
       partTypes: new Map(),
       retryAnnounced: false,
@@ -185,6 +188,7 @@ export class Orchestrator {
       blocked: s.pending ? { kind: s.pending.kind, summary: this.pendingSummary(s.pending) } : undefined,
       lastSpoken: s.lastSpoken,
       lastHeard: s.lastHeard,
+      lang: s.lang,
     };
   }
 
@@ -323,6 +327,7 @@ export class Orchestrator {
     if (s.userPrompt) lines.push(`latest prompt from KπX: ${excerpt(s.userPrompt, 600)}`);
     if (s.lastAnswer) lines.push(`latest answer (excerpt): ${excerpt(s.lastAnswer, 600)}`);
     lines.push(`answer reading mode: ${s.prefs.digest ? "digest" : "full"}`);
+    lines.push(`languages: ${this.cfg.speech.languages.join(", ")} (default ${this.cfg.speech.default}); KπX last spoke ${s.lang}`);
     lines.push(renderLexiconContext(lexicon, this.registry.aliases(), this.cfg.lexicon.contextTerms));
     return lines.join("\n");
   }
@@ -937,6 +942,7 @@ export class Orchestrator {
       streamId: stream?.streamId,
       streamSeq: stream?.streamSeq,
       streamEnd: stream?.streamEnd,
+      lang: s.lang,
     };
     if (kind !== "answer" || !stream || stream.streamSeq === 0) s.lastSpoken = clean;
     else s.lastSpoken = (s.lastSpoken ? s.lastSpoken + " " : "") + clean;
@@ -987,10 +993,11 @@ export class Orchestrator {
     }
     s.streamer.dropBeats();
     this.setPhase(s, "thinking");
+    this.setLanguage(s, opts.lang);
     const lexicon = await this.lexiconFor(s.directory);
     const candidates = candidatesFor(raw, lexicon, this.registry.aliases(), { limit: this.cfg.lexicon.candidateTerms });
     const lines = ["[VOICE]", `transcript: ${raw}`];
-    if (opts.lang) lines.push(`recognizer language: ${opts.lang}`);
+    lines.push(`language: ${s.lang}${opts.lang ? ` (recognizer said ${opts.lang})` : ""}`);
     lines.push(`session is ${s.status}${s.answer ? " and answering" : ""}`);
     if (opts.bargeIn) lines.push(`KπX cut you off while you were saying: ${excerpt(opts.spokenOver ?? s.lastSpoken ?? "", 300)}`);
     else if (s.lastSpoken) lines.push(`last thing you said: ${excerpt(s.lastSpoken, 200)}`);
@@ -1119,6 +1126,22 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * The session language follows the user's speech. A recognizer tag such as
+   * "fr-FR" or a Whisper detection such as "french" both resolve to a code the
+   * voices are keyed by; unknown or "auto" values leave the session as it is.
+   */
+  setLanguage(s: Session, tag: string | undefined) {
+    const code = shortLang(tag);
+    if (!code || code === "auto" || code === s.lang) return;
+    if (this.cfg.speech.languages.length && !this.cfg.speech.languages.includes(code)) {
+      this.log.debug("language outside configured set, kept", { sessionID: s.id, code });
+    }
+    s.lang = code;
+    this.registry.setPrefs(s.id, { lang: code });
+    this.log.info("session language", { sessionID: s.id, lang: code });
+  }
+
   applyControl(s: Session, action: ControlAction) {
     switch (action) {
       case "mute":
@@ -1152,12 +1175,13 @@ export class Orchestrator {
     }
   }
 
-  setPrefs(sessionID: string, prefs: { digest?: boolean; muted?: boolean }) {
+  setPrefs(sessionID: string, prefs: { digest?: boolean; muted?: boolean; lang?: string }) {
     const s = this.sessions.get(sessionID);
     if (!s) return;
     if (prefs.digest !== undefined) s.prefs.digest = prefs.digest;
     if (prefs.muted !== undefined) s.prefs.muted = prefs.muted;
-    this.registry.setPrefs(sessionID, prefs);
+    if (prefs.lang !== undefined) this.setLanguage(s, prefs.lang);
+    this.registry.setPrefs(sessionID, { digest: prefs.digest, muted: prefs.muted });
   }
 
   private async reseed(s: Session) {

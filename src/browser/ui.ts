@@ -17,6 +17,7 @@ export type UiCallbacks = {
   onStop: () => void;
   onRepeat: () => void;
   onToggleDigest: () => void;
+  onCycleLang: () => void;
 };
 
 export type UiState = {
@@ -27,6 +28,8 @@ export type UiState = {
   state: LiveState;
   serverVoice: boolean;
   serverEars: boolean;
+  /** "fr-FR", "en-US" or "auto": what the recognizer is asked to hear. */
+  lang: string;
 };
 
 const STYLE_ID = "opencode-web-stream-style";
@@ -57,6 +60,7 @@ export class Cockpit {
     state: "idle",
     serverVoice: false,
     serverEars: false,
+    lang: "auto",
   };
 
   constructor(private readonly callbacks: UiCallbacks) {}
@@ -122,6 +126,7 @@ export class Cockpit {
           <div class="ows-inject" hidden></div>
         </div>
         <div class="ows-actions">
+          <button type="button" class="ows-chip ows-chip-lang" data-act="lang" title="Langue écoutée : cliquer pour changer">auto</button>
           <button type="button" class="ows-chip" data-act="repeat" title="Répéter la dernière phrase">redire</button>
           <button type="button" class="ows-chip" data-act="digest" title="Lecture complète ou résumée">résumé</button>
           <button type="button" class="ows-chip ows-chip-stop" data-act="stop" title="Couper la voix">stop</button>
@@ -132,6 +137,7 @@ export class Cockpit {
       if (action === "stop") this.callbacks.onStop();
       else if (action === "repeat") this.callbacks.onRepeat();
       else if (action === "digest") this.callbacks.onToggleDigest();
+      else if (action === "lang") this.callbacks.onCycleLang();
     });
     document.body.appendChild(strip);
     this.strip = strip;
@@ -168,6 +174,13 @@ export class Cockpit {
     this.strip?.setAttribute("data-state", live ? state : "off");
     const digestChip = this.strip?.querySelector<HTMLElement>('[data-act="digest"]');
     digestChip?.classList.toggle("is-on", digest);
+    const langChip = this.strip?.querySelector<HTMLElement>('[data-act="lang"]');
+    if (langChip) {
+      const lang = this.state.lang;
+      langChip.textContent = lang === "auto" ? "auto" : lang.split(/[-_]/)[0];
+      langChip.title = lang === "auto" ? "Langue écoutée : automatique (cliquer pour fixer)" : `Langue écoutée : ${lang} (cliquer pour changer)`;
+      langChip.classList.toggle("is-on", lang !== "auto");
+    }
   }
 
   private describe(): string {
@@ -352,6 +365,7 @@ function injectStyle() {
     .ows-chip:hover { opacity: 1; background: color-mix(in srgb, CanvasText 8%, transparent); }
     .ows-chip.is-on { background: rgba(14,165,183,.18); border-color: rgba(14,165,183,.5); opacity: 1; }
     .ows-chip-stop:hover { border-color: rgba(220,38,38,.6); color: #dc2626; }
+    .ows-chip-lang { font-family: ui-monospace, monospace; letter-spacing: .04em; min-width: 3.4em; text-align: center; }
     .ows-chip-cancel { border-color: rgba(220,38,38,.45); }
 
     @media (max-width: 520px) {

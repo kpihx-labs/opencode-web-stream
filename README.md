@@ -34,6 +34,9 @@ session events ──▶ beats ──────────┘──▶ voice 
   as if you had typed it.
 - **Asks when it is unsure.** Where two readings of a sentence lead to two
   different actions, it asks a short question instead of guessing.
+- **Speaks your language, per session.** French or English follows what you
+  last spoke in, with a voice for each. One switch, shared with the
+  opencode-web-voice plugin's selector.
 
 ## Design
 
@@ -61,13 +64,13 @@ Point opencode-lens at `dist/plugin.js` and proxy `/__stream__` and `/ws/stream`
 to the daemon. Speech runs through any OpenAI-compatible transcription and
 synthesis endpoint; with none configured, the browser's own voice and
 recognition take over. Setup for a local, fully offline stack is in
-[AGENTS.md, section 9](AGENTS.md#9-local-setup-on-the-workstation).
+[AGENTS.md, section 10](AGENTS.md#10-local-setup-on-the-workstation).
 
 ## Develop
 
 ```bash
 npm run typecheck   # daemon and cockpit
-npm test            # 81 tests, no network, no model, no microphone
+npm test            # 92 tests, no network, no model, no microphone
 ```
 
 The integration suite drives the real daemon against a fake OpenCode server

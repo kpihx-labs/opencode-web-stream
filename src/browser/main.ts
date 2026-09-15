@@ -24,6 +24,12 @@ declare const __VERSION__: string;
 
 const STATE_KEY = "__opencodeWebStream";
 const LANG_KEY = "opencodeWebStream.lang";
+/**
+ * The opencode-web-voice plugin, when installed alongside, has its own
+ * language selector. Honouring it means one switch for both plugins.
+ */
+const VOICE_PLUGIN_LANG_KEY = "opencodeWebVoiceLang";
+const VOICE_PLUGIN_SELECT = "select.opencode-web-voice-plugin-lang-select";
 const LIVE_KEY = "opencodeWebStream.live";
 const MUTE_KEY = "opencodeWebStream.muted";
 /** A barge-in with no words behind it: resume rather than sit in silence. */
@@ -51,7 +57,11 @@ class CockpitApp {
   private interruptedHeard = "";
   private falseBargeTimer?: number;
   private pendingTranscripts = new Set<AbortController>();
-  private lang = readString(LANG_KEY, navigator.language?.startsWith("en") ? "en-US" : "fr-FR");
+  /** "fr-FR", "en-US", … or "auto". */
+  private lang = resolveLanguagePreference();
+  /** Two-letter codes the daemon is configured for; the chip cycles through these plus "auto". */
+  private languages: string[] = ["fr", "en"];
+  private voicePluginSelect?: HTMLSelectElement;
   private destroyed = false;
 
   constructor() {
@@ -71,10 +81,11 @@ class CockpitApp {
         this.link.send({ type: "prefs", sessionID: this.sessionID, digest: this.digest });
         this.ui.update({ digest: this.digest });
       },
+      onCycleLang: () => this.cycleLanguage(),
     });
 
     this.player = new VoicePlayer(
-      { serverAvailable: () => this.serverVoice, lang: this.lang },
+      { serverAvailable: () => this.serverVoice, lang: this.recognizerLang() },
       {
         onStart: (utterance) => {
           this.speakingUtterance = utterance.id;
@@ -109,9 +120,13 @@ class CockpitApp {
     primeVoices();
     this.sessionID = sessionIdFromLocation();
     this.ui.mount();
-    this.ui.update({ muted: this.muted, state: "idle" });
+    this.ui.update({ muted: this.muted, state: "idle", lang: this.lang });
     this.link.open();
     void this.refreshStatus();
+    this.watchVoicePluginSelector();
+    window.addEventListener("storage", (event) => {
+      if (event.key === VOICE_PLUGIN_LANG_KEY || event.key === LANG_KEY) this.setLanguage(resolveLanguagePreference(), false);
+    });
 
     // Audio needs a gesture; take the first one the page gets.
     const unlock = () => void this.unlockAudio();
@@ -154,9 +169,10 @@ class CockpitApp {
     try {
       const res = await fetch(DaemonLink.apiUrl("/api/status"));
       if (!res.ok) return;
-      const status = (await res.json()) as { tts: { ready: boolean }; stt: { ready: boolean } };
+      const status = (await res.json()) as { tts: { ready: boolean }; stt: { ready: boolean }; speech?: { languages: string[] } };
       this.serverVoice = status.tts.ready;
       this.serverEars = status.stt.ready;
+      if (status.speech?.languages?.length) this.languages = status.speech.languages;
       this.ui.update({ serverVoice: this.serverVoice, serverEars: this.serverEars });
     } catch {
       // The websocket carries status too; this is only a faster first read.
@@ -169,6 +185,71 @@ class CockpitApp {
     const reference = await this.player.unlock();
     this.mic?.setReferenceStream(reference);
     log.debug("audio unlocked", { hasReference: Boolean(reference) });
+  }
+
+  // ---- language -----------------------------------------------------------
+
+  /** What a single-language recognizer is asked to hear: never "auto". */
+  private recognizerLang(): string {
+    if (this.lang !== "auto") return this.lang;
+    const nav = navigator.language || "";
+    const match = this.languages.find((code) => nav.toLowerCase().startsWith(code));
+    const code = match ?? this.languages[0] ?? "fr";
+    return regionalize(code);
+  }
+
+  /** The language sent with a transcript; undefined lets the daemon decide. */
+  private transcriptLang(): string | undefined {
+    return this.lang === "auto" ? undefined : this.lang;
+  }
+
+  private cycleLanguage() {
+    const options = [...this.languages.map(regionalize), "auto"];
+    const index = options.indexOf(this.lang);
+    this.setLanguage(options[(index + 1) % options.length], true);
+  }
+
+  private setLanguage(next: string, persist: boolean) {
+    if (next === this.lang) return;
+    this.lang = next;
+    if (persist) {
+      writeString(LANG_KEY, next);
+      writeString(VOICE_PLUGIN_LANG_KEY, next);
+      // Keep the shared selector in step so the voice plugin follows too.
+      const select = document.querySelector<HTMLSelectElement>(VOICE_PLUGIN_SELECT);
+      if (select && select.value !== next && [...select.options].some((o) => o.value === next)) {
+        select.value = next;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }
+    this.player.setLang(this.recognizerLang());
+    if (this.recognizer) {
+      this.recognizer.setLang(this.recognizerLang());
+      // A running recognizer keeps its language; restart it with the new one.
+      this.recognizer.stop();
+      this.recognizer.start();
+    }
+    this.link.send({ type: "prefs", sessionID: this.sessionID, lang: this.transcriptLang() });
+    this.ui.update({ lang: next });
+    log.info("language", { lang: next, recognizer: this.recognizerLang() });
+  }
+
+  /** Follow the opencode-web-voice selector when that plugin is present. */
+  private watchVoicePluginSelector() {
+    const hook = () => {
+      const select = document.querySelector<HTMLSelectElement>(VOICE_PLUGIN_SELECT);
+      if (!select || select === this.voicePluginSelect) return;
+      this.voicePluginSelect = select;
+      select.addEventListener("change", () => {
+        const value = select.value || "auto";
+        writeString(LANG_KEY, value);
+        this.setLanguage(value, false);
+      });
+      // The selector may appear after we resolved the preference: adopt its value.
+      if (select.value && select.value !== this.lang) this.setLanguage(select.value, false);
+    };
+    hook();
+    new MutationObserver(hook).observe(document.documentElement, { childList: true, subtree: true });
   }
 
   // ---- live mode ----------------------------------------------------------
@@ -228,10 +309,10 @@ class CockpitApp {
         onInterim: (text) => this.ui.showInterim(text),
         onError: (error) => log.debug("recognizer", error),
       });
-      this.recognizer.setLang(this.lang);
+      this.recognizer.setLang(this.recognizerLang());
       await this.recognizer.prepareOnDevice();
       this.recognizer.start();
-      log.info("using browser recognition", { biasing: this.recognizer.supportsBiasing, onDevice: this.recognizer.supportsOnDevice });
+      log.info("using browser recognition", { lang: this.recognizerLang(), biasing: this.recognizer.supportsBiasing, onDevice: this.recognizer.supportsOnDevice });
     } else {
       log.info("using daemon transcription");
     }
@@ -294,7 +375,7 @@ class CockpitApp {
     try {
       const result = await postAudio(
         blob,
-        { sessionID: this.sessionID, lang: this.lang, bargeIn, spokenOver: context.spokenOver, apply: true },
+        { sessionID: this.sessionID, lang: this.transcriptLang(), bargeIn, spokenOver: context.spokenOver, apply: true },
         controller.signal,
       );
       if (!result.text) {
@@ -320,10 +401,10 @@ class CockpitApp {
       onInterim: (text) => this.ui.showInterim(text),
       onError: (error) => log.debug("recognizer", error),
     });
-    this.recognizer.setLang(this.lang);
+    this.recognizer.setLang(this.recognizerLang());
     await this.recognizer.prepareOnDevice();
     this.recognizer.start();
-    log.info("switched to browser recognition");
+    log.info("switched to browser recognition", { lang: this.recognizerLang() });
   }
 
   private async submitTranscript(text: string, context: { bargeIn: boolean; spokenOver?: string }) {
@@ -335,7 +416,8 @@ class CockpitApp {
       text,
       bargeIn: context.bargeIn,
       spokenOver: context.spokenOver,
-      lang: this.lang,
+      // The browser recognizer always ran in one concrete language.
+      lang: this.recognizerLang(),
     });
   }
 
@@ -347,6 +429,7 @@ class CockpitApp {
       case "status": {
         this.serverVoice = msg.status.tts.ready;
         this.serverEars = msg.status.stt.ready;
+        if (msg.status.speech?.languages?.length) this.languages = msg.status.speech.languages;
         this.ui.update({ connected: msg.status.opencode.connected, serverVoice: this.serverVoice, serverEars: this.serverEars });
         return;
       }
@@ -471,6 +554,40 @@ function readString(key: string, fallback: string): string {
     return localStorage.getItem(key) ?? fallback;
   } catch {
     return fallback;
+  }
+}
+
+function writeString(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // not persisted, still applied for this page
+  }
+}
+
+/**
+ * One language switch for both plugins: the opencode-web-voice selector and
+ * its storage key are the source of truth when that plugin is installed. The
+ * cockpit's own key only matters without it. Values are BCP-47 tags or "auto".
+ */
+export function resolveLanguagePreference(): string {
+  const select = typeof document !== "undefined" ? document.querySelector<HTMLSelectElement>(VOICE_PLUGIN_SELECT) : null;
+  if (select?.value) return select.value;
+  const shared = readString(VOICE_PLUGIN_LANG_KEY, "");
+  if (shared) return shared;
+  const own = readString(LANG_KEY, "");
+  if (own) return own;
+  return "auto";
+}
+
+/** "fr" -> "fr-FR" through ICU likely subtags; a full tag passes through. */
+export function regionalize(code: string): string {
+  if (code.includes("-")) return code;
+  try {
+    const locale = new Intl.Locale(code).maximize();
+    return locale.region ? `${locale.language}-${locale.region}` : code;
+  } catch {
+    return code;
   }
 }
 

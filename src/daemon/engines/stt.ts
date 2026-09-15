@@ -63,20 +63,22 @@ export class SttEngine {
   /**
    * @param audio WAV (or any container the server accepts) bytes.
    * @param promptTerms vocabulary to bias toward; joined into the Whisper prompt.
+   * @returns the transcript and, when the server reports it, the detected language.
    */
   async transcribe(
     audio: Buffer,
     opts: { mime?: string; language?: string; promptTerms?: string[]; signal?: AbortSignal } = {},
-  ): Promise<string> {
+  ): Promise<{ text: string; language?: string }> {
     if (!this.enabled) throw new Error("server stt disabled");
     const form = new FormData();
     const mime = opts.mime ?? "audio/wav";
     const ext = mime.includes("webm") ? "webm" : mime.includes("ogg") ? "ogg" : mime.includes("mp3") || mime.includes("mpeg") ? "mp3" : "wav";
     form.set("file", new Blob([new Uint8Array(audio)], { type: mime }), `utterance.${ext}`);
     form.set("model", this.cfg.model);
-    form.set("response_format", "json");
+    // verbose_json carries the language Whisper detected when none is forced.
+    form.set("response_format", "verbose_json");
     const language = opts.language ?? this.cfg.language;
-    if (language && language !== "auto") form.set("language", language.slice(0, 2));
+    if (language && language !== "auto") form.set("language", language.toLowerCase().split(/[-_]/)[0]);
     const terms = (opts.promptTerms ?? []).slice(0, this.cfg.promptTerms);
     if (terms.length) form.set("prompt", buildPrompt(terms));
     const controller = new AbortController();
@@ -89,9 +91,9 @@ export class SttEngine {
         this.ready = false;
         throw new Error(`stt HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)}`);
       }
-      const data = (await res.json()) as { text?: string };
+      const data = (await res.json()) as { text?: string; language?: string };
       this.ready = true;
-      return (data.text ?? "").trim();
+      return { text: (data.text ?? "").trim(), language: normalizeLanguage(data.language) };
     } catch (e) {
       if (!(e instanceof Error && /HTTP/.test(e.message))) this.ready = false;
       throw e;
@@ -100,6 +102,20 @@ export class SttEngine {
       opts.signal?.removeEventListener("abort", onAbort);
     }
   }
+}
+
+/** Whisper servers report "french", "fr" or "fr-FR" depending on the build. */
+export function normalizeLanguage(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const value = raw.trim().toLowerCase();
+  if (!value) return undefined;
+  if (value.length <= 3) return value.split(/[-_]/)[0];
+  // Full names: ask ICU which code displays as this name.
+  const names = new Intl.DisplayNames(["en"], { type: "language" });
+  for (const code of ["fr", "en", "de", "es", "it", "pt", "nl", "ja", "zh", "ko", "ru", "ar"]) {
+    if (names.of(code)?.toLowerCase() === value) return code;
+  }
+  return value.split(/[-_]/)[0].slice(0, 3);
 }
 
 /**

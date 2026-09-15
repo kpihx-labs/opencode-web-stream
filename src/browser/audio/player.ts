@@ -142,7 +142,7 @@ export class VoicePlayer {
     if (!this.opts.serverAvailable()) return;
     for (const item of this.queue.slice(0, 2)) {
       if (item.audio) continue;
-      item.audio = postTts(item.utterance.text)
+      item.audio = postTts(item.utterance.text, item.utterance.lang)
         .catch((err) => {
           log.warn("tts prefetch failed", err);
           return undefined;
@@ -187,7 +187,7 @@ export class VoicePlayer {
   }
 
   private async play(item: QueueItem): Promise<void> {
-    const blob = this.opts.serverAvailable() ? await (item.audio ?? postTts(item.utterance.text).catch(() => undefined)) : undefined;
+    const blob = this.opts.serverAvailable() ? await (item.audio ?? postTts(item.utterance.text, item.utterance.lang).catch(() => undefined)) : undefined;
     if (blob && this.context) {
       await this.playBuffer(item, blob);
       return;
@@ -287,9 +287,10 @@ export class VoicePlayer {
           return;
         }
         const utterance = new SpeechSynthesisUtterance(chunks[index]);
-        utterance.lang = this.lang;
+        const lang = localeFor(item.utterance.lang) ?? this.lang;
+        utterance.lang = lang;
         utterance.rate = this.rate;
-        const voice = pickVoice(this.lang);
+        const voice = pickVoice(lang);
         if (voice) utterance.voice = voice;
         let advanced = false;
         const advance = () => {
@@ -399,6 +400,20 @@ export function approximateHeard(text: string, fraction: number): string {
   const cut = Math.floor(text.length * fraction);
   const space = text.lastIndexOf(" ", cut);
   return text.slice(0, space > 0 ? space : cut).trim();
+}
+
+/**
+ * "fr" -> "fr-FR", "en" -> "en-US": ICU's likely-subtags data picks the
+ * region, so no table is kept here.
+ */
+export function localeFor(lang: string | undefined): string | undefined {
+  if (!lang) return undefined;
+  try {
+    const maximized = new Intl.Locale(lang).maximize();
+    return maximized.region ? `${maximized.language}-${maximized.region}` : maximized.language;
+  } catch {
+    return undefined;
+  }
 }
 
 let voiceCache: SpeechSynthesisVoice[] = [];

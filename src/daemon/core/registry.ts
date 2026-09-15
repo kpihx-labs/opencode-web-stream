@@ -15,7 +15,7 @@ export type StreamerBinding = {
   lastSeedAt: number;
 };
 
-export type SessionPrefs = { digest?: boolean; muted?: boolean };
+export type SessionPrefs = { digest?: boolean; muted?: boolean; lang?: string };
 
 export type Alias = { heard: string; canonical: string; count: number; updatedAt: number };
 
@@ -67,7 +67,8 @@ export class Registry {
   }
 
   setPrefs(sessionID: string, patch: SessionPrefs) {
-    this.data.prefs[sessionID] = { ...(this.data.prefs[sessionID] ?? {}), ...patch };
+    const defined = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
+    this.data.prefs[sessionID] = { ...(this.data.prefs[sessionID] ?? {}), ...defined };
     this.scheduleSave();
   }
 

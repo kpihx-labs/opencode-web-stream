@@ -111,6 +111,23 @@ test("the bundle wires the duplex loop it claims to", () => {
   assert.doesNotMatch(bundle, /127\.0\.0\.1:8765/);
 });
 
+test("language is one switch shared with the voice plugin, fr and en first", () => {
+  // Reads and writes the opencode-web-voice plugin's key and selector.
+  assert.match(bundle, /opencodeWebVoiceLang/);
+  assert.match(bundle, /opencode-web-voice-plugin-lang-select/);
+  // Region comes from ICU likely subtags, not from a table.
+  assert.match(bundle, /Intl\.Locale/);
+  // The voice follows the utterance's language, server side and browser side.
+  assert.match(bundle, /item\.utterance\.lang/);
+  const localeFor = extract("localeFor");
+  assert.equal(localeFor("fr"), "fr-FR");
+  assert.equal(localeFor("en"), "en-US");
+  assert.equal(localeFor(undefined), undefined);
+  const regionalize = extract("regionalize");
+  assert.equal(regionalize("fr"), "fr-FR");
+  assert.equal(regionalize("en-GB"), "en-GB");
+});
+
 test("the bundle carries no leftover heuristics", () => {
   // No tool classification, no confidence gate, no clarification templates.
   assert.doesNotMatch(bundle, /SILENT_TOOLS|CATEGORY_MAP/);

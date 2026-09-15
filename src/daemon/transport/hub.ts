@@ -202,7 +202,7 @@ export class Hub implements Outbound {
           this.orchestrator.onSpoken(msg.sessionID, msg.utteranceId, msg.completed, msg.heardText);
           return;
         case "prefs":
-          this.orchestrator.setPrefs(msg.sessionID, { digest: msg.digest, muted: msg.muted });
+          this.orchestrator.setPrefs(msg.sessionID, { digest: msg.digest, muted: msg.muted, lang: msg.lang });
           return;
         case "control": {
           const s = this.orchestrator.sessions.get(msg.sessionID);
@@ -250,6 +250,7 @@ export class Hub implements Outbound {
       opencode: this.orchestrator.connection,
       tts: this.deps.tts.describe(),
       stt: this.deps.stt.describe(),
+      speech: { languages: this.deps.cfg.speech.languages, default: this.deps.cfg.speech.default },
       sessions: this.orchestrator.snapshots(),
     };
   }
@@ -302,13 +303,13 @@ export class Hub implements Outbound {
         return;
       }
       if (req.method === "POST" && path === "/api/tts") {
-        const body = (await readJson(req)) as { text: string; voice?: string; speed?: number };
+        const body = (await readJson(req)) as { text: string; lang?: string; voice?: string; speed?: number };
         if (!body.text?.trim()) {
           json(res, 400, { error: "text required" });
           return;
         }
         try {
-          const out = await this.deps.tts.synthesize(body.text, { voice: body.voice, speed: body.speed });
+          const out = await this.deps.tts.synthesize(body.text, { voice: body.voice, lang: body.lang, speed: body.speed });
           res.writeHead(200, { "content-type": out.contentType, "content-length": out.bytes.length, "cache-control": "no-store" });
           res.end(out.bytes);
         } catch (e) {
@@ -329,16 +330,18 @@ export class Hub implements Outbound {
           return;
         }
         try {
-          const text = await this.deps.stt.transcribe(audio, {
+          const { text, language } = await this.deps.stt.transcribe(audio, {
             mime,
             language: lang || undefined,
             promptTerms: this.orchestrator.phrasesFor(sessionID),
           });
+          // A forced language is authoritative; otherwise Whisper's detection is.
+          const spoken = lang && lang !== "auto" ? lang : language;
           let decision: string | undefined;
           if (apply && text && sessionID) {
-            decision = await this.orchestrator.onTranscript(sessionID, text, { bargeIn, spokenOver, lang: lang || undefined });
+            decision = await this.orchestrator.onTranscript(sessionID, text, { bargeIn, spokenOver, lang: spoken });
           }
-          json(res, 200, { text, decision });
+          json(res, 200, { text, language: spoken, decision });
         } catch (e) {
           json(res, 502, { error: e instanceof Error ? e.message : String(e) });
         }

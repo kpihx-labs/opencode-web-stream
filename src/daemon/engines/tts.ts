@@ -32,6 +32,12 @@ export class TtsEngine {
     return { engine: this.isReady ? ("server" as const) : ("browser" as const), ready: this.isReady, voice: this.cfg.voice };
   }
 
+  /** The configured voice for a language, else the fallback voice. */
+  voiceFor(lang?: string): string {
+    const key = (lang ?? "").toLowerCase().split(/[-_]/)[0];
+    return (key && this.cfg.voices[key]) || this.cfg.voice;
+  }
+
   /** Probe the endpoint's server; cached for 30 s. */
   async check(force = false): Promise<boolean> {
     if (!this.enabled) return false;
@@ -62,12 +68,12 @@ export class TtsEngine {
     return this.checking;
   }
 
-  async synthesize(text: string, opts: { voice?: string; speed?: number; signal?: AbortSignal } = {}): Promise<TtsResult> {
+  async synthesize(text: string, opts: { voice?: string; lang?: string; speed?: number; signal?: AbortSignal } = {}): Promise<TtsResult> {
     if (!this.enabled) throw new Error("server tts disabled");
     const body = {
       model: this.cfg.model,
       input: text,
-      voice: opts.voice ?? this.cfg.voice,
+      voice: opts.voice ?? this.voiceFor(opts.lang),
       response_format: this.cfg.format,
       speed: opts.speed ?? this.cfg.speed,
     };

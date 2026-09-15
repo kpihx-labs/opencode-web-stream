@@ -194,12 +194,12 @@ export async function postAudio(
   return (await res.json()) as { text: string; decision?: string };
 }
 
-/** Fetch synthesized audio for one utterance. */
-export async function postTts(text: string, signal?: AbortSignal): Promise<Blob> {
+/** Fetch synthesized audio for one utterance, in the voice of its language. */
+export async function postTts(text: string, lang?: string, signal?: AbortSignal): Promise<Blob> {
   const res = await fetch(DaemonLink.apiUrl("/api/tts"), {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, lang }),
     signal,
   });
   if (!res.ok) throw new Error(`tts HTTP ${res.status}`);

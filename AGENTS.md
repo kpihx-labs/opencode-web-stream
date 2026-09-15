@@ -202,7 +202,37 @@ The candidates are suggestions. Only the streamer decides what was said.
 
 ---
 
-## 6. Edge cases the implementation must keep handling
+## 6. Languages
+
+Speech here is French carrying English identifiers, and sometimes plain
+English. Two decisions follow.
+
+**The session language is what the user last spoke in.** The recognizer says
+which language it ran in (`fr-FR`, `en-US`), or Whisper reports what it
+detected when no language is pinned. That code is stored per session, briefed
+to the streamer, stamped on every utterance, and used to pick the voice —
+`tts.voices` maps codes to voices, `tts.voice` is the fallback. The streamer's
+prompt tells it to answer in the user's language, so the chain is consistent
+end to end.
+
+**Per-sentence language detection is not used.** Two trigram detectors were
+measured on the sentences this system actually produces. « Je patche le hook
+et je relance npm test » came back as English with full confidence; « Let me
+check the daemon config first » came back as French. Code-switched technical
+speech defeats them, and a wrong guess would put an English voice on a French
+sentence mid-answer. A reliable signal the user controls beats a clever one
+that is wrong a quarter of the time.
+
+**One switch for both plugins.** The cockpit reads and writes the language
+selector of the opencode-web-voice plugin (`opencodeWebVoiceLang`, and its
+`<select>` when present), so pinning French there pins it here. Its own chip
+cycles `fr → en → auto` and pushes the choice back into that selector. `auto`
+means Whisper detects; the browser recognizer, which cannot detect, then runs
+in the navigator's language.
+
+---
+
+## 7. Edge cases the implementation must keep handling
 
 Each of these is covered by a test; treat the list as a specification.
 
@@ -236,7 +266,7 @@ Each of these is covered by a test; treat the list as a specification.
 
 ---
 
-## 7. Logging and debugging
+## 8. Logging and debugging
 
 Logs follow the usual level ladder (`trace` … `fatal`) on **pino**, one JSON
 object per line on stdout, so `journalctl -u opencode-web-stream -o cat | jq`
@@ -258,7 +288,7 @@ buffer, and `log.setLevel("debug")` raises verbosity without a rebuild.
 
 ---
 
-## 8. Working on this repository
+## 9. Working on this repository
 
 ```bash
 npm install
@@ -277,15 +307,15 @@ When you add behaviour:
 - If it involves a judgement, it belongs in `agent/streamer.md`, not in code.
 - If it involves timing, it belongs in `config.ts` with a default and a test.
 - If it changes the wire, bump `PROTOCOL_VERSION`.
-- If it is an edge case, add a row to section 6 and a test alongside it.
+- If it is an edge case, add a row to section 7 and a test alongside it.
 
 ---
 
-## 9. Local setup on the workstation
+## 10. Local setup on the workstation
 
 Everything below runs on the machine; nothing leaves it.
 
-### 9.1 Service
+### 10.1 Service
 
 ```ini
 # ~/.config/systemd/user/opencode-web-stream.service
@@ -313,20 +343,29 @@ systemctl --user daemon-reload
 systemctl --user enable --now opencode-web-stream
 ```
 
-### 9.2 Lens
+### 10.2 Lens
 
-Point the Lens proxy at the built cockpit and add `/__stream__` and `/ws/stream`
-as passthrough routes to `127.0.0.1:8765`:
+The cockpit only ever talks to its own origin: HTTP under `/__stream__/` and a
+WebSocket at `/ws/stream`. The Lens proxy already bridges both to the daemon,
+so the Tailscale HTTPS name works with no extra configuration.
+
+`lens/lens-proxy.mjs` is that proxy with one change: the daemon's address is
+read from `OPENCODE_WEB_STREAM_TARGET` (default `http://127.0.0.1:8765`)
+instead of being written twice in the file. Copy it over
+`opencode-lens/scripts/lens-proxy.mjs`; nothing else in it moved, so the other
+plugins are unaffected.
+
+Register the plugin through the manifest, alongside the others, in the
+comma-separated `OPENCODE_WEB_PLUGINS` of the `opencode-lens` unit:
 
 ```ini
-Environment="OPENCODE_WEB_PLUGINS=/home/kpihx/.agents/skills/k-opencode/scripts/plugins/web/opencode-web-stream/dist/plugin.js"
-Environment="OPENCODE_WEB_STREAM_PROXY=http://127.0.0.1:8765"
+Environment="OPENCODE_WEB_PLUGINS=…/opencode-web-voice/lens.plugin.json,…/opencode-web-stream/lens.plugin.json"
 ```
 
-The cockpit only ever talks to its own origin, so the Tailscale HTTPS name
-works with no extra configuration once those two paths are proxied.
+The manifest points at `dist/plugin.js`, which Lens inlines into the page, so
+`npm run build` followed by a page reload is the whole deploy.
 
-### 9.3 Speech engines
+### 10.3 Speech engines
 
 Any OpenAI-compatible endpoint works. On an Intel Arc integrated GPU with 32 GB
 of shared memory, [speaches](https://github.com/speaches-ai/speaches) serves
@@ -344,14 +383,16 @@ curl -s -X POST localhost:8000/v1/models/speaches-ai/Kokoro-82M-v1.0-ONNX
 ```
 
 Defaults in `config.ts` already point at `127.0.0.1:8000` with
-`Systran/faster-whisper-large-v3` and the French Kokoro voice `ff_siwis`.
+`Systran/faster-whisper-large-v3`, Whisper language detection on, the French
+Kokoro voice `ff_siwis` and the English one `af_heart`.
 Override per machine in `~/.config/opencode-web-stream/config.json`:
 
 ```json
 {
   "opencode": { "url": "http://127.0.0.1:40977" },
-  "stt": { "url": "http://127.0.0.1:8000/v1/audio/transcriptions", "model": "Systran/faster-whisper-large-v3", "language": "fr" },
-  "tts": { "url": "http://127.0.0.1:8000/v1/audio/speech", "model": "speaches-ai/Kokoro-82M-v1.0-ONNX", "voice": "ff_siwis", "speed": 1.05 },
+  "speech": { "languages": ["fr", "en"], "default": "fr" },
+  "stt": { "url": "http://127.0.0.1:8000/v1/audio/transcriptions", "model": "Systran/faster-whisper-large-v3", "language": "auto" },
+  "tts": { "url": "http://127.0.0.1:8000/v1/audio/speech", "model": "speaches-ai/Kokoro-82M-v1.0-ONNX", "voices": { "fr": "ff_siwis", "en": "af_heart" }, "voice": "ff_siwis", "speed": 1.05 },
   "streamer": { "model": "opencode-go/muse-spark-1.3-contributor" }
 }
 ```
@@ -371,7 +412,7 @@ Notes for this hardware:
   the cockpit then uses the browser's own recognition and synthesis, with no
   other change.
 
-### 9.4 Agent
+### 10.4 Agent
 
 ```bash
 cp agent/streamer.md ~/.config/opencode/agents/streamer.md

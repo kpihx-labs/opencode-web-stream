@@ -7,7 +7,7 @@
  * instead of silently misbehaving.
  */
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** Lifecycle of one live session, mirrored on both sides. */
 export type LiveState =
@@ -51,6 +51,8 @@ export type Utterance = {
   streamEnd?: boolean;
   /** Session title, spoken as a prefix when several sessions are live. */
   sessionLabel?: string;
+  /** Two-letter language of the text, so the right voice reads it. */
+  lang?: string;
 };
 
 export type SessionSnapshot = {
@@ -65,6 +67,8 @@ export type SessionSnapshot = {
   lastSpoken?: string;
   /** Last transcript the daemon accepted, raw then corrected. */
   lastHeard?: { raw: string; corrected: string };
+  /** Two-letter code of the language the user last spoke in. */
+  lang: string;
 };
 
 export type DaemonStatus = {
@@ -72,6 +76,8 @@ export type DaemonStatus = {
   opencode: { connected: boolean; url: string; lastError?: string };
   tts: { engine: "server" | "browser"; ready: boolean; voice?: string };
   stt: { engine: "browser" | "server"; ready: boolean };
+  /** Languages the daemon is configured for; the cockpit offers these plus "auto". */
+  speech: { languages: string[]; default: string };
   sessions: SessionSnapshot[];
 };
 
@@ -129,7 +135,7 @@ export type ClientMessage =
   /** The cockpit finished (or gave up on) an utterance. */
   | { type: "spoken"; sessionID: string; utteranceId: string; completed: boolean; heardText?: string }
   /** Cockpit-local preference changes worth persisting server-side. */
-  | { type: "prefs"; sessionID: string; digest?: boolean; muted?: boolean }
+  | { type: "prefs"; sessionID: string; digest?: boolean; muted?: boolean; lang?: string }
   /** Direct control from a cockpit button rather than from voice. */
   | { type: "control"; sessionID: string; action: ControlAction }
   | { type: "visible"; sessionID: string; visible: boolean }

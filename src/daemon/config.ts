@@ -53,10 +53,23 @@ export type Config = {
     tableNotice: string;
     minAnswerCharsForDigest: number;
   };
+  /**
+   * Languages spoken in the sessions. The session language is whatever the
+   * user last spoke in, as reported by the recognizer or detected by Whisper;
+   * it travels with every utterance so the right voice reads it. Per-sentence
+   * language detectors were evaluated and rejected: on French sentences that
+   * carry English identifiers they guess wrong with full confidence.
+   */
+  speech: {
+    /** Two-letter codes, first is the default. */
+    languages: string[];
+    default: string;
+  };
   stt: {
     /** OpenAI-compatible transcription endpoint; empty disables server STT. */
     url: string;
     model: string;
+    /** Two-letter code forced on the recognizer, or "auto" to let it detect. */
     language: string;
     promptTerms: number;
     timeoutMs: number;
@@ -65,7 +78,10 @@ export type Config = {
     /** OpenAI-compatible speech endpoint; empty disables server TTS. */
     url: string;
     model: string;
+    /** Fallback voice when no per-language voice matches. */
     voice: string;
+    /** Voice per two-letter language code. */
+    voices: Record<string, string>;
     format: "wav" | "mp3" | "opus" | "flac" | "pcm";
     speed: number;
     timeoutMs: number;
@@ -115,10 +131,14 @@ export const DEFAULTS: Config = {
     tableNotice: "Je t'affiche un tableau à l'écran.",
     minAnswerCharsForDigest: 600,
   },
+  speech: {
+    languages: ["fr", "en"],
+    default: "fr",
+  },
   stt: {
     url: "http://127.0.0.1:8000/v1/audio/transcriptions",
     model: "Systran/faster-whisper-large-v3",
-    language: "fr",
+    language: "auto",
     promptTerms: 60,
     timeoutMs: 20000,
   },
@@ -126,6 +146,7 @@ export const DEFAULTS: Config = {
     url: "http://127.0.0.1:8000/v1/audio/speech",
     model: "speaches-ai/Kokoro-82M-v1.0-ONNX",
     voice: "ff_siwis",
+    voices: { fr: "ff_siwis", en: "af_heart" },
     format: "wav",
     speed: 1.05,
     timeoutMs: 15000,
@@ -186,9 +207,23 @@ function applyEnv(cfg: Config, env: NodeJS.ProcessEnv) {
   if (env.OPENCODE_WEB_STREAM_TTS_URL !== undefined) cfg.tts.url = env.OPENCODE_WEB_STREAM_TTS_URL;
   if (env.OPENCODE_WEB_STREAM_TTS_VOICE) cfg.tts.voice = env.OPENCODE_WEB_STREAM_TTS_VOICE;
   if (env.OPENCODE_WEB_STREAM_STT_LANG) cfg.stt.language = env.OPENCODE_WEB_STREAM_STT_LANG;
+  if (env.OPENCODE_WEB_STREAM_LANGUAGES) {
+    cfg.speech.languages = env.OPENCODE_WEB_STREAM_LANGUAGES.split(",").map((l) => l.trim().toLowerCase()).filter(Boolean);
+    cfg.speech.default = cfg.speech.languages[0] ?? cfg.speech.default;
+  }
+  cfg.speech.languages = cfg.speech.languages.map(shortLang);
+  cfg.speech.default = shortLang(cfg.speech.default);
   cfg.opencode.url = cfg.opencode.url.replace(/\/+$/, "");
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** "fr-FR" -> "fr"; anything unusable -> "". */
+export function shortLang(tag: string | undefined): string {
+  if (!tag) return "";
+  const trimmed = tag.trim().toLowerCase();
+  if (!trimmed || trimmed === "auto") return trimmed === "auto" ? "auto" : "";
+  return trimmed.split(/[-_]/)[0].slice(0, 3);
 }
