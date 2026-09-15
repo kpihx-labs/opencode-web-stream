@@ -70,7 +70,7 @@ recognition take over. Setup for a local, fully offline stack is in
 
 ```bash
 npm run typecheck   # daemon and cockpit
-npm test            # 92 tests, no network, no model, no microphone
+npm test            # 104 tests, no network, no model, no microphone
 ```
 
 The integration suite drives the real daemon against a fake OpenCode server

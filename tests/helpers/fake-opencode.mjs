@@ -163,7 +163,14 @@ export class FakeOpencode {
 
     if (path === "/session" && req.method === "POST") {
       return void collect().then((body) => {
-        const created = this.addSession({ title: body.title, directory: body.directory ?? [...this.sessions.values()][0]?.directory ?? "/tmp/project" });
+        // The real server routes by `x-opencode-directory`, not by the body.
+        const directory =
+          req.headers["x-opencode-directory"] ??
+          url.searchParams.get("directory") ??
+          body.directory ??
+          [...this.sessions.values()][0]?.directory ??
+          "/tmp/project";
+        const created = this.addSession({ title: body.title, directory });
         json(res, 200, created);
       });
     }

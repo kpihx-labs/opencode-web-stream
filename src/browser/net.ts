@@ -160,7 +160,7 @@ export class DaemonLink {
   }
 
   attach(sessionID: string, directory: string | undefined, visible: boolean) {
-    this.send({ type: "attach", sessionID, directory, protocol: PROTOCOL_VERSION, visible });
+    this.send({ type: "attach", sessionID, directory: directory || undefined, protocol: PROTOCOL_VERSION, visible });
   }
 
   close() {
@@ -176,10 +176,12 @@ export class DaemonLink {
 /** POST audio to the daemon's transcription proxy. */
 export async function postAudio(
   blob: Blob,
-  params: { sessionID: string; lang?: string; bargeIn?: boolean; spokenOver?: string; apply?: boolean },
+  params: { sessionID: string; directory?: string; lang?: string; bargeIn?: boolean; spokenOver?: string; apply?: boolean },
   signal?: AbortSignal,
 ): Promise<{ text: string; decision?: string }> {
   const query = new URLSearchParams({ session: params.sessionID });
+  // Without a session yet, the directory is what lets the daemon create one.
+  if (params.directory) query.set("directory", params.directory);
   if (params.lang) query.set("lang", params.lang);
   if (params.bargeIn) query.set("bargeIn", "1");
   if (params.spokenOver) query.set("spokenOver", params.spokenOver.slice(0, 500));

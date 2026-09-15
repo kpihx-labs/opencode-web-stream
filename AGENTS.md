@@ -239,6 +239,9 @@ Each of these is covered by a test; treat the list as a specification.
 | Situation | Expected behaviour |
 | --- | --- |
 | Live enabled before any prompt | Streamer created, context seeded with `noReply`, no model call yet. |
+| Live enabled on the new-session page | Armed against the directory in the URL; no session lookup, no model call. |
+| Speaking with no session yet | The session is created, the cockpit is moved onto it, then the ordinary path runs. |
+| No directory in the URL | The daemon says so out loud instead of calling the API with an empty id. |
 | Browser reload | Daemon keeps the state; the cockpit resyncs without replaying speech. |
 | OpenCode restart | Binding survives; a 404 on the streamer session recreates it. |
 | Daemon restart | Registry reloaded, SSE resubscribed. |
@@ -263,6 +266,24 @@ Each of these is covered by a test; treat the list as a specification.
 | Streamer unreachable | The raw transcript is queued rather than lost. |
 | Streamer answers off-format | Parsed as `<quiet/>` and logged; never read aloud. |
 | Live disabled | Streamer dormant, zero model calls, session kept for next time. |
+
+### Two rules the cockpit must keep
+
+**The observer must never react to its own writes.** The composer is replaced
+on navigation, so the whole document is watched; painting also writes to the
+document, and `setAttribute` queues a mutation record even when the value is
+unchanged. Unguarded, that is an infinite loop that freezes the tab. Three
+things prevent it, and all three are load-bearing: `paint()` writes through
+`setAttr`/`setText`, which read before writing; a paint in progress
+short-circuits the observer callback; and mutations on the cockpit's own nodes
+are filtered out. Any new DOM write in the cockpit goes through those helpers.
+
+**An instruction must land where the user can see it.** Injection goes through
+`prompt_async` on a real session, so the message appears in the web UI exactly
+as if it had been typed. On the new-session page there is no session yet: the
+daemon creates one, sends `navigate`, and the cockpit follows with
+`pushState` plus a `popstate` event, falling back to a real load if the app's
+router does not follow. Never simulate typing into the composer.
 
 ---
 
@@ -362,8 +383,15 @@ comma-separated `OPENCODE_WEB_PLUGINS` of the `opencode-lens` unit:
 Environment="OPENCODE_WEB_PLUGINS=…/opencode-web-voice/lens.plugin.json,…/opencode-web-stream/lens.plugin.json"
 ```
 
-The manifest points at `dist/plugin.js`, which Lens inlines into the page, so
-`npm run build` followed by a page reload is the whole deploy.
+The manifest points at `dist/plugin.js`, which Lens reads **once at startup**
+and keeps in memory. A rebuild alone therefore changes nothing in the browser:
+
+```bash
+npm run build && systemctl --user restart opencode-lens
+```
+
+Reloading the page without restarting the proxy serves the previous bundle,
+which makes a fixed bug look unfixed.
 
 ### 10.3 Speech engines
 

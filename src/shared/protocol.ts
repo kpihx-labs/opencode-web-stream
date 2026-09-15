@@ -7,7 +7,7 @@
  * instead of silently misbehaving.
  */
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** Lifecycle of one live session, mirrored on both sides. */
 export type LiveState =
@@ -99,6 +99,12 @@ export type ServerMessage =
   | { type: "heard"; sessionID: string; raw: string; corrected: string; decision: string }
   /** Vocabulary for the recognizer's contextual biasing. */
   | { type: "lexicon"; sessionID: string; phrases: string[] }
+  /**
+   * A session was created for a cockpit that had none (the user spoke on the
+   * new-session page). The cockpit follows, so the conversation is visible
+   * exactly as if they had typed and pressed enter.
+   */
+  | { type: "navigate"; sessionID: string; directory: string; url: string }
   | { type: "error"; message: string }
   | { type: "reload"; reason: string }
   | { type: "pong"; t: number };
@@ -117,8 +123,8 @@ export type ClientMessage =
   /** Cockpit announces itself and the session it is looking at. */
   | { type: "attach"; sessionID: string; directory?: string; protocol: number; visible: boolean }
   | { type: "detach"; sessionID: string }
-  /** Live mode toggled from the cockpit button. */
-  | { type: "live"; sessionID: string; enabled: boolean }
+  /** Live mode toggled from the cockpit button. `sessionID` is empty on the new-session page. */
+  | { type: "live"; sessionID: string; enabled: boolean; directory?: string }
   /** A final transcript. `spokenOver` is what the user heard before cutting in. */
   | {
       type: "transcript";
@@ -127,6 +133,8 @@ export type ClientMessage =
       spokenOver?: string;
       bargeIn: boolean;
       lang?: string;
+      /** Set when `sessionID` is empty: where to create the session. */
+      directory?: string;
     }
   /** The user started speaking while we were talking: stop audio now. */
   | { type: "barge_in"; sessionID: string; spokenOver?: string }

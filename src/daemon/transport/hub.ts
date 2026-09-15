@@ -84,6 +84,21 @@ export class Hub implements Outbound {
     for (const c of this.clients.values()) if (c.sessionID === sessionID) this.send(c, msg);
   }
 
+  /**
+   * A cockpit that was on the new-session page now belongs to a real session.
+   * Rebinding before sending means the notification and everything after it
+   * reach the same cockpit.
+   */
+  rebind(from: string, to: string, msg: ServerMessage) {
+    const moved = [...this.clients.values()].filter((c) => (c.sessionID ?? "") === from);
+    for (const c of moved) {
+      c.sessionID = to;
+      c.attachedAt = Date.now();
+      this.send(c, msg);
+    }
+    this.log.info("cockpits rebound", { from: from || "(new session)", to, count: moved.length });
+  }
+
   speak(utterance: Utterance) {
     const speaker = this.speakerFor(utterance.sessionID);
     if (speaker) {
@@ -168,10 +183,10 @@ export class Hub implements Outbound {
             return;
           }
           client.sessionID = msg.sessionID;
-          client.directory = msg.directory;
+          if (msg.directory) client.directory = msg.directory;
           client.visible = msg.visible;
           client.attachedAt = Date.now();
-          const snap = this.orchestrator.snapshot(msg.sessionID);
+          const snap = msg.sessionID ? this.orchestrator.snapshot(msg.sessionID) : undefined;
           if (snap) {
             this.send(client, { type: "state", sessionID: msg.sessionID, state: snap.state, blocked: snap.blocked });
             this.send(client, { type: "lexicon", sessionID: msg.sessionID, phrases: this.orchestrator.phrasesFor(msg.sessionID) });
@@ -183,14 +198,21 @@ export class Hub implements Outbound {
           return;
         case "live": {
           client.sessionID = msg.sessionID;
+          if (msg.directory) client.directory = msg.directory;
           const snap = await this.orchestrator.setLive(msg.sessionID, msg.enabled, client.directory);
-          if (!snap) this.send(client, { type: "error", message: "session introuvable côté OpenCode" });
+          if (!snap) this.send(client, { type: "error", message: "Je ne sais pas dans quel dossier travailler. Ouvre un projet d'abord." });
           else this.send(client, { type: "state", sessionID: msg.sessionID, state: snap.state, blocked: snap.blocked });
           this.broadcastStatus();
           return;
         }
         case "transcript":
-          await this.orchestrator.onTranscript(msg.sessionID, msg.text, { bargeIn: msg.bargeIn, spokenOver: msg.spokenOver, lang: msg.lang });
+          if (msg.directory) client.directory = msg.directory;
+          await this.orchestrator.onTranscript(msg.sessionID, msg.text, {
+            bargeIn: msg.bargeIn,
+            spokenOver: msg.spokenOver,
+            lang: msg.lang,
+            directory: msg.directory ?? client.directory,
+          });
           return;
         case "barge_in":
           this.orchestrator.onBargeIn(msg.sessionID);
@@ -319,6 +341,7 @@ export class Hub implements Outbound {
       }
       if (req.method === "POST" && path === "/api/stt") {
         const sessionID = url.searchParams.get("session") ?? String(req.headers["x-session"] ?? "");
+        const directory = url.searchParams.get("directory") ?? undefined;
         const lang = url.searchParams.get("lang") ?? String(req.headers["x-lang"] ?? "");
         const apply = url.searchParams.get("apply") !== "0";
         const bargeIn = url.searchParams.get("bargeIn") === "1";
@@ -338,8 +361,8 @@ export class Hub implements Outbound {
           // A forced language is authoritative; otherwise Whisper's detection is.
           const spoken = lang && lang !== "auto" ? lang : language;
           let decision: string | undefined;
-          if (apply && text && sessionID) {
-            decision = await this.orchestrator.onTranscript(sessionID, text, { bargeIn, spokenOver, lang: spoken });
+          if (apply && text && (sessionID || directory)) {
+            decision = await this.orchestrator.onTranscript(sessionID, text, { bargeIn, spokenOver, lang: spoken, directory });
           }
           json(res, 200, { text, language: spoken, decision });
         } catch (e) {

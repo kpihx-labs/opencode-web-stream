@@ -52,6 +52,9 @@ export class Cockpit {
   private observer?: MutationObserver;
   private composer?: HTMLElement;
   private injectTimer?: number;
+  /** True while paint() writes, so the observer ignores what those writes queue. */
+  private painting = false;
+  private attachScheduled = false;
   private state: UiState = {
     live: false,
     connected: false,
@@ -69,9 +72,31 @@ export class Cockpit {
     injectStyle();
     this.ensureStrip();
     this.attach();
-    // OpenCode Web is a single-page app: the composer is replaced on navigation.
-    this.observer = new MutationObserver(() => this.attach());
+    // OpenCode Web is a single-page app: the composer is replaced on navigation,
+    // so the whole document is watched. Painting also writes to the document,
+    // and `setAttribute` queues a mutation record even when the value does not
+    // change — so an unguarded observer would call itself forever and freeze the
+    // tab. Three things prevent that: our own mutations are filtered out, a
+    // paint in progress short-circuits the callback, and the work is coalesced
+    // into one animation frame.
+    this.observer = new MutationObserver((records) => {
+      if (this.painting) return;
+      if (records.every((record) => isOurs(record.target))) return;
+      this.scheduleAttach();
+    });
     this.observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  /** One attach per frame, however many mutations arrived. */
+  private scheduleAttach() {
+    if (this.attachScheduled) return;
+    this.attachScheduled = true;
+    const run = () => {
+      this.attachScheduled = false;
+      this.attach();
+    };
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+    else setTimeout(run, 16);
   }
 
   private attach() {
@@ -152,34 +177,50 @@ export class Cockpit {
     this.paint();
   }
 
+  /**
+   * Render the current state. Every write goes through a helper that reads
+   * first, so a paint that changes nothing touches the DOM not at all — which
+   * is what keeps the observer quiet in the common case.
+   */
   private paint() {
-    this.ensureStrip();
-    const { live, connected, muted, digest, state } = this.state;
-    if (this.button) {
-      this.button.dataset.state = live ? state : "off";
-      this.button.classList.toggle("is-live", live);
-      this.button.classList.toggle("is-offline", !connected);
-      this.button.title = this.describe();
-      this.button.setAttribute("aria-pressed", String(live));
-      this.button.setAttribute("aria-label", this.describe());
-    }
-    if (this.muteButton) {
-      this.muteButton.classList.toggle("is-muted", muted);
-      this.muteButton.title = muted ? "Narration coupée" : "Narration active";
-      this.muteButton.setAttribute("aria-label", this.muteButton.title);
-      this.muteButton.textContent = muted ? "🔇" : "🔊";
-    }
-    this.composer?.classList.toggle("ows-composer-live", live);
-    this.strip?.classList.toggle("is-visible", live);
-    this.strip?.setAttribute("data-state", live ? state : "off");
-    const digestChip = this.strip?.querySelector<HTMLElement>('[data-act="digest"]');
-    digestChip?.classList.toggle("is-on", digest);
-    const langChip = this.strip?.querySelector<HTMLElement>('[data-act="lang"]');
-    if (langChip) {
-      const lang = this.state.lang;
-      langChip.textContent = lang === "auto" ? "auto" : lang.split(/[-_]/)[0];
-      langChip.title = lang === "auto" ? "Langue écoutée : automatique (cliquer pour fixer)" : `Langue écoutée : ${lang} (cliquer pour changer)`;
-      langChip.classList.toggle("is-on", lang !== "auto");
+    this.painting = true;
+    try {
+      this.ensureStrip();
+      const { live, connected, muted, digest, state } = this.state;
+      if (this.button) {
+        const label = this.describe();
+        setAttr(this.button, "data-state", live ? state : "off");
+        this.button.classList.toggle("is-live", live);
+        this.button.classList.toggle("is-offline", !connected);
+        setAttr(this.button, "title", label);
+        setAttr(this.button, "aria-pressed", String(live));
+        setAttr(this.button, "aria-label", label);
+      }
+      if (this.muteButton) {
+        const title = muted ? "Narration coupée" : "Narration active";
+        this.muteButton.classList.toggle("is-muted", muted);
+        setAttr(this.muteButton, "title", title);
+        setAttr(this.muteButton, "aria-label", title);
+        setText(this.muteButton, muted ? "🔇" : "🔊");
+      }
+      this.composer?.classList.toggle("ows-composer-live", live);
+      this.strip?.classList.toggle("is-visible", live);
+      if (this.strip) setAttr(this.strip, "data-state", live ? state : "off");
+      const digestChip = this.strip?.querySelector<HTMLElement>('[data-act="digest"]');
+      digestChip?.classList.toggle("is-on", digest);
+      const langChip = this.strip?.querySelector<HTMLElement>('[data-act="lang"]');
+      if (langChip) {
+        const lang = this.state.lang;
+        setText(langChip, lang === "auto" ? "auto" : lang.split(/[-_]/)[0]);
+        setAttr(langChip, "title", lang === "auto" ? "Langue écoutée : automatique (cliquer pour fixer)" : `Langue écoutée : ${lang} (cliquer pour changer)`);
+        langChip.classList.toggle("is-on", lang !== "auto");
+      }
+    } finally {
+      // Records queued by the writes above are delivered at the next microtask
+      // checkpoint, so the flag has to outlive this call by one turn.
+      queueMicrotask(() => {
+        this.painting = false;
+      });
     }
   }
 
@@ -270,6 +311,7 @@ export class Cockpit {
 
   destroy() {
     this.observer?.disconnect();
+    this.attachScheduled = false;
     if (this.injectTimer) window.clearInterval(this.injectTimer);
     this.button?.remove();
     this.muteButton?.remove();
@@ -277,6 +319,33 @@ export class Cockpit {
     this.composer?.classList.remove("ows-composer-live");
     document.getElementById(STYLE_ID)?.remove();
   }
+}
+
+/**
+ * Is this node part of the cockpit's own UI? Tested by capability rather than
+ * by `instanceof`, which fails across realms and would silently let every
+ * mutation through.
+ */
+export function isOurs(node: unknown): boolean {
+  let current = node as { hasAttribute?: (n: string) => boolean; closest?: (s: string) => unknown; parentNode?: unknown } | null;
+  for (let depth = 0; current && depth < 12; depth++) {
+    if (typeof current.hasAttribute === "function" && current.hasAttribute("data-opencode-stream")) return true;
+    if (typeof current.closest === "function" && current.closest("[data-opencode-stream]")) return true;
+    current = (current.parentNode ?? null) as typeof current;
+  }
+  return false;
+}
+
+/** Write an attribute only when it differs: an identical write still mutates. */
+export function setAttr(element: Element, name: string, value: string) {
+  if (element.getAttribute(name) === value) return;
+  element.setAttribute(name, value);
+}
+
+/** Same idea for text: assigning textContent replaces every child node. */
+export function setText(element: Element, value: string) {
+  if (element.textContent === value) return;
+  element.textContent = value;
 }
 
 function escapeHtml(text: string): string {

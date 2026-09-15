@@ -32,6 +32,8 @@ import { IncrementalSpeechReader, parseStreamerOutput, type Decision } from "./t
 export type Outbound = {
   /** Send to every cockpit attached to the session. */
   toSession(sessionID: string, msg: ServerMessage): void;
+  /** Move every cockpit sitting on `from` onto `to`, then notify them. */
+  rebind(from: string, to: string, msg: ServerMessage): void;
   /** Send to the cockpit currently elected speaker for the session (or a fallback in the directory). */
   speak(utterance: Utterance): void;
   /** Sessions in the same directory that have a live cockpit, for cross-session notices. */
@@ -97,6 +99,8 @@ export class Orchestrator {
   private readonly log: ScopedLogger;
   private opencodeConnected = false;
   private lastOpencodeError?: string;
+  /** Directories where a cockpit armed live before any session existed. */
+  private readonly pendingLive = new Set<string>();
 
   constructor(
     private readonly cfg: Config,
@@ -202,6 +206,22 @@ export class Orchestrator {
   // ---- live toggling -------------------------------------------------------
 
   async setLive(sessionID: string, enabled: boolean, directoryHint?: string): Promise<SessionSnapshot | undefined> {
+    // The new-session page has no session yet. Live is armed against the
+    // directory; the session itself is created the moment the user speaks.
+    if (!sessionID) {
+      if (!directoryHint) {
+        this.log.warn("live on a new session without a directory");
+        return undefined;
+      }
+      if (enabled) {
+        this.pendingLive.add(directoryHint);
+        void this.lexiconFor(directoryHint);
+        this.log.info("live armed for a new session", { directory: directoryHint });
+      } else {
+        this.pendingLive.delete(directoryHint);
+      }
+      return { sessionID: "", title: "", directory: directoryHint, state: enabled ? "listening" : "idle", live: enabled, lang: this.cfg.speech.default };
+    }
     let s = this.sessions.get(sessionID);
     if (!s) {
       const directory = directoryHint || (await this.resolveDirectory(sessionID));
@@ -268,6 +288,7 @@ export class Orchestrator {
   }
 
   private async resolveDirectory(sessionID: string): Promise<string | undefined> {
+    if (!sessionID) return undefined;
     const known = this.sessions.get(sessionID)?.directory;
     if (known) return known;
     const bound = this.registry.binding(sessionID)?.directory;
@@ -980,12 +1001,19 @@ export class Orchestrator {
     if (s.phase === "interrupted") this.setPhase(s, "speaking");
   }
 
-  async onTranscript(sessionID: string, text: string, opts: { bargeIn: boolean; spokenOver?: string; lang?: string }): Promise<string> {
-    const s = this.sessions.get(sessionID) ?? this.ensureSession(sessionID, "");
+  async onTranscript(sessionID: string, text: string, opts: { bargeIn: boolean; spokenOver?: string; lang?: string; directory?: string }): Promise<string> {
     const raw = text.trim();
     if (!raw) return "empty";
+    // No session yet: create one now, and move the cockpit onto it, so what
+    // follows lands in a conversation the user can actually see.
+    if (!sessionID) {
+      const created = await this.materialize(opts.directory);
+      if (!created) return "no-session";
+      sessionID = created;
+    }
+    const s = this.sessions.get(sessionID) ?? this.ensureSession(sessionID, opts.directory ?? "");
     if (!s.live) {
-      await this.setLive(sessionID, true);
+      await this.setLive(sessionID, true, opts.directory);
     }
     if (!s.streamer) {
       await this.startStreamer(s);
@@ -1029,6 +1057,40 @@ export class Orchestrator {
     return res.decisions.map((d) => d.kind).join(",");
   }
 
+  /**
+   * Create the session the user is about to talk to, and hand the cockpit its
+   * address. This is the voice equivalent of typing into the new-session
+   * composer and pressing enter: OpenCode owns the session, the web UI shows
+   * it, and everything after this point is the ordinary path.
+   */
+  private async materialize(directory: string | undefined): Promise<string | undefined> {
+    const dir = directory || [...this.pendingLive][0];
+    if (!dir) {
+      this.log.error("cannot create a session: no directory known");
+      return undefined;
+    }
+    try {
+      const created = await this.client.createSession(dir, {});
+      this.pendingLive.delete(dir);
+      const s = this.ensureSession(created.id, created.directory || dir);
+      this.applySessionInfo(s, created);
+      s.live = true;
+      this.log.info("session created for a voice turn", { sessionID: created.id, directory: dir });
+      this.out.rebind("", created.id, {
+        type: "navigate",
+        sessionID: created.id,
+        directory: created.directory || dir,
+        url: sessionUrl(created.directory || dir, created.id),
+      });
+      this.setPhase(s, "thinking");
+      await this.startStreamer(s);
+      return created.id;
+    } catch (e) {
+      this.log.error("session creation failed", { directory: dir, error: e instanceof Error ? e.message : String(e) });
+      return undefined;
+    }
+  }
+
   // ---- actions on the main session ----------------------------------------
 
   private scheduleInject(s: Session, text: string, mode: "queue" | "interrupt") {
@@ -1057,6 +1119,11 @@ export class Orchestrator {
   }
 
   private async executeInject(s: Session, id: string, text: string, mode: "queue" | "interrupt") {
+    if (!s.id || !s.directory) {
+      this.log.error("inject without a session", { sessionID: s.id, directory: s.directory });
+      this.out.toSession(s.id, { type: "inject_done", sessionID: s.id, injectId: id, ok: false, error: "no session" });
+      return;
+    }
     try {
       if (mode === "interrupt" && s.status === "busy") {
         await this.client.abort(s.id, s.directory);
@@ -1208,4 +1275,12 @@ export class Orchestrator {
     }
     for (const t of this.lexiconRefresh.values()) clearTimeout(t);
   }
+}
+
+/**
+ * The address of a session in OpenCode Web: `/:base64(directory)/session/:id`.
+ * Base64 of the directory is how the app itself encodes it in the path.
+ */
+export function sessionUrl(directory: string, sessionID: string): string {
+  return `/${Buffer.from(directory, "utf8").toString("base64")}/session/${encodeURIComponent(sessionID)}`;
 }

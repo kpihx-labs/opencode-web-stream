@@ -46,6 +46,8 @@ class CockpitApp {
   private mic?: Microphone;
   private recognizer?: BrowserRecognizer;
   private sessionID = "";
+  /** The workspace in the URL. Known even on the new-session page, which is what lets the daemon create a session there. */
+  private directory = "";
   private live = false;
   private muted = readFlag(MUTE_KEY, false);
   private digest = false;
@@ -109,7 +111,7 @@ class CockpitApp {
       onMessage: (msg) => this.onServerMessage(msg),
       onOpen: () => {
         this.ui.update({ connected: true });
-        this.link.attach(this.sessionID, undefined, !document.hidden);
+        this.link.attach(this.sessionID, this.directory, !document.hidden);
         if (this.live) this.link.send({ type: "live", sessionID: this.sessionID, enabled: true });
       },
       onClose: () => this.ui.update({ connected: false }),
@@ -119,6 +121,7 @@ class CockpitApp {
   async start() {
     primeVoices();
     this.sessionID = sessionIdFromLocation();
+    this.directory = directoryFromLocation();
     this.ui.mount();
     this.ui.update({ muted: this.muted, state: "idle", lang: this.lang });
     this.link.open();
@@ -154,14 +157,27 @@ class CockpitApp {
 
   private syncSession() {
     const next = sessionIdFromLocation();
-    if (!next || next === this.sessionID) return;
+    const nextDirectory = directoryFromLocation();
+    if (nextDirectory && nextDirectory !== this.directory) {
+      this.directory = nextDirectory;
+      this.link.attach(this.sessionID, this.directory, !document.hidden);
+    }
+    if (next === this.sessionID) return;
+    // Arriving on a session we just created: keep listening, do not tear down.
+    if (next && this.sessionID === "") {
+      log.info("new session materialised", { sessionID: next });
+      this.sessionID = next;
+      this.link.attach(next, this.directory, !document.hidden);
+      return;
+    }
+    if (!next) return;
     log.info("session changed", { from: this.sessionID, to: next });
     const wasLive = this.live;
     if (wasLive) void this.stopListening();
     this.link.send({ type: "detach", sessionID: this.sessionID });
     this.player.cancel();
     this.sessionID = next;
-    this.link.attach(next, undefined, !document.hidden);
+    this.link.attach(next, this.directory, !document.hidden);
     if (wasLive) void this.toggleLive(true);
   }
 
@@ -260,7 +276,7 @@ class CockpitApp {
     this.live = next;
     writeFlag(LIVE_KEY, next);
     this.ui.update({ live: next, state: next ? "listening" : "idle" });
-    this.link.send({ type: "live", sessionID: this.sessionID, enabled: next });
+    this.link.send({ type: "live", sessionID: this.sessionID, enabled: next, directory: this.directory });
     if (next) {
       await this.unlockAudio();
       await this.startListening();
@@ -375,7 +391,7 @@ class CockpitApp {
     try {
       const result = await postAudio(
         blob,
-        { sessionID: this.sessionID, lang: this.transcriptLang(), bargeIn, spokenOver: context.spokenOver, apply: true },
+        { sessionID: this.sessionID, directory: this.directory, lang: this.transcriptLang(), bargeIn, spokenOver: context.spokenOver, apply: true },
         controller.signal,
       );
       if (!result.text) {
@@ -418,6 +434,7 @@ class CockpitApp {
       spokenOver: context.spokenOver,
       // The browser recognizer always ran in one concrete language.
       lang: this.recognizerLang(),
+      directory: this.directory,
     });
   }
 
@@ -468,6 +485,10 @@ class CockpitApp {
         log.debug("lexicon received", { terms: msg.phrases.length });
         return;
       }
+      case "navigate": {
+        this.followNavigation(msg.sessionID, msg.directory, msg.url);
+        return;
+      }
       case "control": {
         this.applyControl(msg.action);
         return;
@@ -516,6 +537,36 @@ class CockpitApp {
     }
   }
 
+  /**
+   * The daemon created a session for us. Move the page onto it without a
+   * reload, so the microphone and the audio graph survive; if the app's router
+   * does not follow, load the address outright rather than leave the user
+   * looking at a page that no longer matches the conversation.
+   */
+  private followNavigation(sessionID: string, directory: string, url: string) {
+    log.info("following the new session", { sessionID, url });
+    this.sessionID = sessionID;
+    if (directory) this.directory = directory;
+    if (sessionIdFromLocation() === sessionID) return;
+    try {
+      history.pushState({}, "", url);
+      window.dispatchEvent(new PopStateEvent("popstate", { state: history.state }));
+    } catch (err) {
+      log.warn("pushState refused, loading the address", err);
+      location.assign(url);
+      return;
+    }
+    // A router that ignored the event leaves the old view in place; the URL is
+    // the only thing we can check, so check it and fall back to a real load.
+    window.setTimeout(() => {
+      if (this.destroyed) return;
+      if (sessionIdFromLocation() !== sessionID) {
+        log.warn("the app did not follow, loading the address");
+        location.assign(url);
+      }
+    }, 900);
+  }
+
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
@@ -530,6 +581,32 @@ class CockpitApp {
 export function sessionIdFromLocation(pathname = location.pathname): string {
   const match = pathname.match(/\/session\/([^/?#]+)/);
   return match ? decodeURIComponent(match[1]) : "";
+}
+
+/**
+ * The workspace the page is looking at. OpenCode Web puts it in the path as
+ * base64, and it is there even on the new-session page (`/:dir/session`),
+ * which is exactly what the daemon needs to create a session on the user's
+ * first spoken word.
+ */
+export function directoryFromLocation(pathname = location.pathname): string {
+  const match = pathname.match(/^\/([^/]+)\/session(?:\/|$)/);
+  if (!match) return "";
+  return decodeBase64(match[1]);
+}
+
+function decodeBase64(value: string): string {
+  try {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    const decoded = new TextDecoder().decode(bytes);
+    // A real path, not a route segment that merely looked like base64.
+    return decoded.startsWith("/") || decoded.includes("/") ? decoded : "";
+  } catch {
+    return "";
+  }
 }
 
 function readFlag(key: string, fallback: boolean): boolean {
