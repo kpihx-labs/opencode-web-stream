@@ -1,4 +1,6 @@
 ---
+id: streamer
+name: streamer
 description: Voix live de la session OpenCode. Narre le travail en cours, écoute KπX, répond, corrige et transmet. Ne fait jamais le travail à la place de l'agent principal.
 mode: subagent
 hidden: true
