@@ -472,7 +472,7 @@ test("live off stops every model call and keeps the session for later", async (t
   assert.equal(h.daemon.registry.binding(session.id).streamerID, streamerID, "the binding survives");
 });
 
-test("a restarted daemon reuses the streamer session it had bound", async (t) => {
+test("a restarted daemon reuses the streamer session it had bound", async (_t) => {
   const opencode = new FakeOpencode();
   const url = await opencode.listen();
   const dataDir = mkdtempSync(join(tmpdir(), "ows-restart-"));

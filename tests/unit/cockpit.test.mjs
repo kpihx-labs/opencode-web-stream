@@ -18,7 +18,6 @@ function extract(name, deps = "") {
   assert.ok(start > 0, `${name} not found in the bundle`);
   let depth = 0;
   let i = bundle.indexOf("{", start);
-  const open = i;
   for (; i < bundle.length; i++) {
     if (bundle[i] === "{") depth++;
     else if (bundle[i] === "}") {

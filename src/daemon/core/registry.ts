@@ -63,12 +63,12 @@ export class Registry {
   }
 
   prefs(sessionID: string): SessionPrefs {
-    return { ...(this.data.prefs[sessionID] ?? {}) };
+    return { ...this.data.prefs[sessionID] };
   }
 
   setPrefs(sessionID: string, patch: SessionPrefs) {
     const defined = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
-    this.data.prefs[sessionID] = { ...(this.data.prefs[sessionID] ?? {}), ...defined };
+    this.data.prefs[sessionID] = { ...this.data.prefs[sessionID], ...defined };
     this.scheduleSave();
   }
 
