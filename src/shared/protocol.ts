@@ -7,7 +7,7 @@
  * instead of silently misbehaving.
  */
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /** Lifecycle of one live session, mirrored on both sides. */
 export type LiveState =
@@ -124,7 +124,7 @@ export type ClientMessage =
   | { type: "attach"; sessionID: string; directory?: string; protocol: number; visible: boolean }
   | { type: "detach"; sessionID: string }
   /** Live mode toggled from the cockpit button. `sessionID` is empty on the new-session page. */
-  | { type: "live"; sessionID: string; enabled: boolean; directory?: string }
+  | { type: "live"; sessionID: string; enabled: boolean; directory?: string; lang?: string }
   /** A final transcript. `spokenOver` is what the user heard before cutting in. */
   | {
       type: "transcript";

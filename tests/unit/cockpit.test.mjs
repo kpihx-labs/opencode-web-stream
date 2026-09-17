@@ -134,3 +134,26 @@ test("the bundle carries no leftover heuristics", () => {
   assert.doesNotMatch(bundle, /needs_clarification/);
   assert.doesNotMatch(bundle, /Peux-tu me préciser/);
 });
+
+test("the draft store reveals the folder on a new-session page", () => {
+  const directoryFromDraft = extract("directoryFromDraft", 'const TABS_KEY="opencode.window.browser.dat:tabs";');
+  const tabs = JSON.stringify([
+    { type: "draft", draftID: "ea3bf1d2", server: "https://x", directory: "/home/kpihx/KpihX-Labs/Explore" },
+    { type: "draft", draftID: "other", server: "https://x", directory: "/tmp" },
+  ]);
+  globalThis.location = { search: "?draftId=ea3bf1d2" };
+  globalThis.localStorage = { getItem: (key) => (key === "opencode.window.browser.dat:tabs" ? tabs : null) };
+  try {
+    assert.equal(directoryFromDraft(), "/home/kpihx/KpihX-Labs/Explore");
+    globalThis.location = { search: "?draftId=missing" };
+    assert.equal(directoryFromDraft(), "");
+    globalThis.location = { search: "" };
+    assert.equal(directoryFromDraft(), "");
+    globalThis.localStorage = { getItem: () => null };
+    globalThis.location = { search: "?draftId=ea3bf1d2" };
+    assert.equal(directoryFromDraft(), "");
+  } finally {
+    delete globalThis.location;
+    delete globalThis.localStorage;
+  }
+});

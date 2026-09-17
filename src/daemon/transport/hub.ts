@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { PROTOCOL_VERSION, type ClientMessage, type DaemonStatus, type ServerMessage, type Utterance } from "../../shared/protocol.js";
+import { phrase, pickLang } from "../../shared/phrases.js";
 import type { Config } from "../config.js";
 import type { Logger, ScopedLogger } from "../log.js";
 import type { Orchestrator, Outbound } from "../core/orchestrator.js";
@@ -199,8 +200,8 @@ export class Hub implements Outbound {
         case "live": {
           client.sessionID = msg.sessionID;
           if (msg.directory) client.directory = msg.directory;
-          const snap = await this.orchestrator.setLive(msg.sessionID, msg.enabled, client.directory);
-          if (!snap) this.send(client, { type: "error", message: "Je ne sais pas dans quel dossier travailler. Ouvre un projet d'abord." });
+          const snap = await this.orchestrator.setLive(msg.sessionID, msg.enabled, client.directory, msg.lang);
+          if (!snap) this.send(client, { type: "error", message: phrase(pickLang(msg.lang), "daemon.liveRefused") });
           else this.send(client, { type: "state", sessionID: msg.sessionID, state: snap.state, blocked: snap.blocked });
           this.broadcastStatus();
           return;

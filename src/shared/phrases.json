@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "defaultLang": "fr",
+  "languages": {
+    "fr": {
+      "cockpit": {
+        "liveButton": {
+          "noDir": "Live : aucun dossier détecté, ouvre d'abord un projet"
+        }
+      },
+      "daemon": {
+        "noDirectory": "Je ne sais pas dans quel dossier travailler. Ouvre d'abord un projet, puis réactive le direct.",
+        "liveRefused": "Je ne sais pas dans quel dossier travailler. Ouvre un projet d'abord."
+      }
+    },
+    "en": {
+      "cockpit": {
+        "liveButton": {
+          "noDir": "Live: no folder detected, open a project first"
+        }
+      },
+      "daemon": {
+        "noDirectory": "I don't know which folder to work in. Open a project first, then turn live back on.",
+        "liveRefused": "I don't know which folder to work in. Open a project first."
+      }
+    }
+  }
+}

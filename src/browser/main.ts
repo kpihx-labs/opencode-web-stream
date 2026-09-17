@@ -121,14 +121,17 @@ class CockpitApp {
   async start() {
     primeVoices();
     this.sessionID = sessionIdFromLocation();
-    this.directory = directoryFromLocation();
+    this.directory = directoryFromLocation() || directoryFromDraft();
     this.ui.mount();
     this.ui.update({ muted: this.muted, state: "idle", lang: this.lang });
+    this.refreshDirState();
     this.link.open();
     void this.refreshStatus();
     this.watchVoicePluginSelector();
     window.addEventListener("storage", (event) => {
       if (event.key === VOICE_PLUGIN_LANG_KEY || event.key === LANG_KEY) this.setLanguage(resolveLanguagePreference(), false);
+      // The user picked another project in the new-session UI: re-resolve.
+      if (event.key === TABS_KEY) this.syncSession();
     });
 
     // Audio needs a gesture; take the first one the page gets.
@@ -157,10 +160,15 @@ class CockpitApp {
 
   private syncSession() {
     const next = sessionIdFromLocation();
-    const nextDirectory = directoryFromLocation();
+    const nextDirectory = directoryFromLocation() || directoryFromDraft();
     if (nextDirectory && nextDirectory !== this.directory) {
+      const hadNoDir = !this.directory;
       this.directory = nextDirectory;
       this.link.attach(this.sessionID, this.directory, !document.hidden);
+      this.refreshDirState();
+      // The daemon refused live for lack of a folder; now that we have one,
+      // ask again so the armed state follows without another click.
+      if (hadNoDir && this.live) this.link.send({ type: "live", sessionID: this.sessionID, enabled: true, directory: this.directory });
     }
     if (next === this.sessionID) return;
     // Arriving on a session we just created: keep listening, do not tear down.
@@ -179,6 +187,11 @@ class CockpitApp {
     this.sessionID = next;
     this.link.attach(next, this.directory, !document.hidden);
     if (wasLive) void this.toggleLive(true);
+  }
+
+  /** Grey the live button while no working directory is known. */
+  private refreshDirState() {
+    this.ui.update({ noDir: !this.directory && !this.sessionID });
   }
 
   private async refreshStatus() {
@@ -276,7 +289,7 @@ class CockpitApp {
     this.live = next;
     writeFlag(LIVE_KEY, next);
     this.ui.update({ live: next, state: next ? "listening" : "idle" });
-    this.link.send({ type: "live", sessionID: this.sessionID, enabled: next, directory: this.directory });
+    this.link.send({ type: "live", sessionID: this.sessionID, enabled: next, directory: this.directory, lang: this.transcriptLang() });
     if (next) {
       await this.unlockAudio();
       await this.startListening();
@@ -584,15 +597,45 @@ export function sessionIdFromLocation(pathname = location.pathname): string {
 }
 
 /**
- * The workspace the page is looking at. OpenCode Web puts it in the path as
- * base64, and it is there even on the new-session page (`/:dir/session`),
- * which is exactly what the daemon needs to create a session on the user's
- * first spoken word.
+ * The workspace the page is looking at. Older OpenCode Web layouts put it in
+ * the path as base64 (`/:dir/session`); current ones keep a client-side draft
+ * instead (see `directoryFromDraft` below), so the path alone is checked first
+ * and the draft store second.
  */
 export function directoryFromLocation(pathname = location.pathname): string {
   const match = pathname.match(/^\/([^/]+)\/session(?:\/|$)/);
   if (!match) return "";
   return decodeBase64(match[1]);
+}
+
+const TABS_KEY = "opencode.window.browser.dat:tabs";
+
+/**
+ * The folder the new-session page is about to work in. OpenCode Web keeps it
+ * in a client-side draft: `?draftId=` in the URL, entry in the tabs store
+ * (`{ type: "draft", draftID, server, directory }`) — never in the path, so
+ * the path regex above cannot see it. Read the store instead: synchronous,
+ * available at startup and on every navigation.
+ */
+export function directoryFromDraft(search = location.search): string {
+  const draftId = new URLSearchParams(search).get("draftId");
+  if (!draftId) return "";
+  try {
+    const raw = localStorage.getItem(TABS_KEY);
+    if (!raw) return "";
+    const tabs: unknown = JSON.parse(raw);
+    if (!Array.isArray(tabs)) return "";
+    for (const tab of tabs) {
+      if (!tab || typeof tab !== "object") continue;
+      const entry = tab as { draftID?: unknown; draftId?: unknown; directory?: unknown };
+      if (entry.draftID !== draftId && entry.draftId !== draftId) continue;
+      // A real path, not a label: the daemon creates sessions in it.
+      return typeof entry.directory === "string" && entry.directory.startsWith("/") ? entry.directory : "";
+    }
+    return "";
+  } catch {
+    return "";
+  }
 }
 
 function decodeBase64(value: string): string {

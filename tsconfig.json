@@ -6,6 +6,7 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["node"],
     "strict": true,
+    "resolveJsonModule": true,
     "noUncheckedIndexedAccess": false,
     "skipLibCheck": true,
     "declaration": false,

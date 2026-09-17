@@ -1,4 +1,5 @@
 import type { LiveState } from "../shared/protocol.js";
+import { phrase, pickLang } from "../shared/phrases.js";
 
 /**
  * The cockpit's surface inside OpenCode Web.
@@ -30,6 +31,8 @@ export type UiState = {
   serverEars: boolean;
   /** "fr-FR", "en-US" or "auto": what the recognizer is asked to hear. */
   lang: string;
+  /** True when live cannot start server-side: new session, no known directory. */
+  noDir: boolean;
 };
 
 const STYLE_ID = "opencode-web-stream-style";
@@ -64,6 +67,7 @@ export class Cockpit {
     serverVoice: false,
     serverEars: false,
     lang: "auto",
+    noDir: false,
   };
 
   constructor(private readonly callbacks: UiCallbacks) {}
@@ -186,12 +190,13 @@ export class Cockpit {
     this.painting = true;
     try {
       this.ensureStrip();
-      const { live, connected, muted, digest, state } = this.state;
+      const { live, connected, muted, digest, state, noDir } = this.state;
       if (this.button) {
         const label = this.describe();
         setAttr(this.button, "data-state", live ? state : "off");
         this.button.classList.toggle("is-live", live);
         this.button.classList.toggle("is-offline", !connected);
+        this.button.classList.toggle("is-nodir", noDir && !live);
         setAttr(this.button, "title", label);
         setAttr(this.button, "aria-pressed", String(live));
         setAttr(this.button, "aria-label", label);
@@ -226,6 +231,11 @@ export class Cockpit {
 
   private describe(): string {
     if (!this.state.connected) return "Live : démon injoignable";
+    if (!this.state.live && this.state.noDir) {
+      // The selector value ("fr-FR", "en-US", "auto"); "auto" follows the browser.
+      const tag = this.state.lang === "auto" ? navigator.language : this.state.lang;
+      return phrase(pickLang(tag), "cockpit.liveButton.noDir");
+    }
     if (!this.state.live) return "Live : éteint, cliquer pour activer";
     const map: Record<LiveState, string> = {
       idle: "Live : au repos",
@@ -371,6 +381,8 @@ function injectStyle() {
     .ows-button:focus-visible, .ows-mute:focus-visible { outline: 2px solid #0ea5b7; outline-offset: 2px; opacity: 1; }
     .ows-mute.is-muted { opacity: .85; }
     .ows-button.is-offline { opacity: .3; cursor: not-allowed; }
+    .ows-button.is-nodir { opacity: .35; }
+    .ows-button.is-nodir:hover { opacity: .6; }
 
     .ows-waves { display: flex; align-items: center; gap: 2px; height: 14px; }
     .ows-waves i { width: 2.5px; height: 5px; border-radius: 2px; background: currentColor; display: block; }

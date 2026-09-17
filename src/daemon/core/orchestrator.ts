@@ -11,6 +11,7 @@ import type {
 } from "../../shared/opencode-events.js";
 import { isTextPart, isToolPart } from "../../shared/opencode-events.js";
 import type { ControlAction, LiveState, ServerMessage, SessionSnapshot, SpeechKind, Utterance } from "../../shared/protocol.js";
+import { phrase, pickLang } from "../../shared/phrases.js";
 import { shortLang, type Config } from "../config.js";
 import type { Logger, ScopedLogger } from "../log.js";
 import { buildLexicon, type Lexicon } from "../lexicon/build.js";
@@ -205,12 +206,13 @@ export class Orchestrator {
 
   // ---- live toggling -------------------------------------------------------
 
-  async setLive(sessionID: string, enabled: boolean, directoryHint?: string): Promise<SessionSnapshot | undefined> {
+  async setLive(sessionID: string, enabled: boolean, directoryHint?: string, lang?: string): Promise<SessionSnapshot | undefined> {
     // The new-session page has no session yet. Live is armed against the
     // directory; the session itself is created the moment the user speaks.
     if (!sessionID) {
       if (!directoryHint) {
         this.log.warn("live on a new session without a directory");
+        if (enabled) this.speakNoDirectory(lang);
         return undefined;
       }
       if (enabled) {
@@ -246,6 +248,23 @@ export class Orchestrator {
       this.setPhase(s, "idle");
     }
     return this.snapshot(sessionID);
+  }
+
+  /**
+   * Tell the cockpit, out loud and in its own language, why live cannot
+   * start. No session exists yet so this bypasses the per-session speech
+   * queue and talks straight to the cockpit sitting on the empty page.
+   */
+  private speakNoDirectory(langTag?: string) {
+    const lang = pickLang(langTag, this.cfg.speech.default);
+    this.out.speak({
+      id: `utt_${randomUUID().slice(0, 10)}`,
+      sessionID: "",
+      kind: "system",
+      text: phrase(lang, "daemon.noDirectory"),
+      expiresAt: 0,
+      lang: this.cfg.speech.default,
+    });
   }
 
   /** Fill title, agent, model, last prompt and answer from the server. */
@@ -1013,7 +1032,7 @@ export class Orchestrator {
     }
     const s = this.sessions.get(sessionID) ?? this.ensureSession(sessionID, opts.directory ?? "");
     if (!s.live) {
-      await this.setLive(sessionID, true, opts.directory);
+      await this.setLive(sessionID, true, opts.directory, opts.lang);
     }
     if (!s.streamer) {
       await this.startStreamer(s);
