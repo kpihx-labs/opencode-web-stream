@@ -1,6 +1,6 @@
 {
   "name": "opencode-web-stream",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Live voice companion for OpenCode Web: duplex narration, barge-in, voice control, phonetic lexicon. Daemon + Lens cockpit plugin.",
   "keywords": [
     "opencode",
