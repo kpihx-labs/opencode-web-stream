@@ -40,32 +40,37 @@ test("normalizeEdgeVoice maps stale Kokoro voices and generates valid Sec-MS-GEC
   );
 });
 
-test("DecisionEngine parses local qwen3 JSON responses and strips think tags", async () => {
+test("DecisionEngine parses Ollaya /v1/systemone Choice and Noul responses", async () => {
   const seen = [];
   const fakeFetch = async (url, init) => {
     if (String(url).endsWith("/v1/models")) {
-      return new Response(JSON.stringify({ data: [{ id: "qwen3-0.6b" }] }), { status: 200 });
+      return new Response(JSON.stringify({ models: [{ name: "largha:latest" }] }), { status: 200 });
     }
     seen.push(JSON.parse(init.body));
-    const userMsg = seen.at(-1).messages[1].content;
-    if (userMsg.includes("tais-toi")) {
-      return new Response(JSON.stringify({ choices: [{ message: { content: "<think>fast</think>{\"intent\":\"stop\"}" } }] }), { status: 200 });
+    const state = seen.at(-1).state;
+    const qs = seen.at(-1).questions;
+    if (qs.intent) {
+      if (state.includes("tais-toi")) {
+        return new Response(JSON.stringify({ answers: { intent: { type: "choice", choice: "stop", confidence: 0.4, probabilities: { stop: 0.72, noise: 0.14, pass: 0.14 } } } }), { status: 200 });
+      }
+      if (state.includes("euh")) {
+        return new Response(JSON.stringify({ answers: { intent: { type: "choice", choice: "noise", confidence: 0.3, probabilities: { stop: 0.15, noise: 0.61, pass: 0.24 } } } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ answers: { intent: { type: "choice", choice: "pass", confidence: 0.5, probabilities: { stop: 0.1, noise: 0.1, pass: 0.8 } } } }), { status: 200 });
     }
-    if (userMsg.includes("euh")) {
-      return new Response(JSON.stringify({ choices: [{ message: { content: "{\"intent\":\"noise\"}" } }] }), { status: 200 });
-    }
-    return new Response(JSON.stringify({ choices: [{ message: { content: "{\"speak\":false}" } }] }), { status: 200 });
+    return new Response(JSON.stringify({ answers: { worth_speaking: { type: "noul", noul: 0.22 } } }), { status: 200 });
   };
 
   const engine = new DecisionEngine(DEFAULTS.decision, log, fakeFetch);
   assert.equal(await engine.check(true), true);
   assert.equal(await engine.triageVoice("tais-toi", { speaking: true, busy: false }), "stop");
   assert.equal(await engine.triageVoice("euh", { speaking: true, busy: false }), "noise");
+  assert.equal(await engine.triageVoice("bonjour", { speaking: false, busy: false }), "pass");
   assert.equal(await engine.triageBeat("read file foo.ts"), false);
-  assert.equal(seen[0].chat_template_kwargs.enable_thinking, false);
+  assert.equal(seen.at(-1).model, "largha");
 });
 
-test("DecisionEngine degrades to pass/true when local OpenVINO is offline", async () => {
+test("DecisionEngine degrades to pass/true when local Ollaya is offline", async () => {
   const downFetch = async () => {
     throw new Error("ECONNREFUSED");
   };

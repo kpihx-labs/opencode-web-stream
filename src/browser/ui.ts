@@ -57,7 +57,9 @@ export class Cockpit {
   private injectBox?: HTMLElement;
   private levelBar?: HTMLElement;
   private observer?: MutationObserver;
+  private resizeHandler?: () => void;
   private composer?: HTMLElement;
+  private mountParent?: HTMLElement;
   private injectTimer?: number;
   /** True while paint() writes, so the observer ignores what those writes queue. */
   private painting = false;
@@ -93,6 +95,11 @@ export class Cockpit {
       this.scheduleAttach();
     });
     this.observer.observe(document.documentElement, { childList: true, subtree: true });
+    this.resizeHandler = () => this.scheduleAttach();
+    window.addEventListener("resize", this.resizeHandler);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) this.scheduleAttach();
+    });
   }
 
   /** One attach per frame, however many mutations arrived. */
@@ -103,23 +110,24 @@ export class Cockpit {
       this.attachScheduled = false;
       this.attach();
     };
-    if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+    if (!document.hidden && typeof requestAnimationFrame === "function") requestAnimationFrame(run);
     else setTimeout(run, 16);
   }
 
   private attach() {
     const composer = document.querySelector<HTMLElement>(COMPOSER_SELECTORS);
-    if (!composer) return;
-    this.composer = composer;
-    if (composer.querySelector("[data-opencode-stream]")) {
+    const target = resolveVisibleMount(composer);
+    if (!target) return;
+    this.composer = composer ?? target.actions;
+
+    // Re-mount cleanly when V2 switches between desktop composer-actions and mobile bottom bar.
+    if (this.button?.isConnected && this.mountParent === target.actions && isVisibleElement(this.button)) {
+      this.mountStripNear(this.composer);
       this.paint();
       return;
     }
-    const actions =
-      composer.querySelector<HTMLElement>('[data-slot="composer-actions"]') ??
-      composer.querySelector<HTMLElement>('[data-action="prompt-attach"]')?.parentElement ??
-      composer.querySelector<HTMLElement>('[data-component="prompt-agent-control"]')?.parentElement ??
-      composer;
+    this.button?.remove();
+    this.muteButton?.remove();
 
     const button = document.createElement("button");
     button.type = "button";
@@ -127,6 +135,7 @@ export class Cockpit {
     button.setAttribute("data-component", "icon-button-v2");
     button.setAttribute("data-size", "normal");
     button.setAttribute("data-variant", "ghost-muted");
+    if (target.mobile) button.dataset.owsMobile = "1";
     button.className = "ows-button";
     button.innerHTML = `<span class="ows-sr">Mode live</span><span class="ows-waves">${"<i></i>".repeat(4)}</span>`;
     button.addEventListener("click", (event) => {
@@ -140,6 +149,7 @@ export class Cockpit {
     mute.setAttribute("data-component", "icon-button-v2");
     mute.setAttribute("data-size", "normal");
     mute.setAttribute("data-variant", "ghost-muted");
+    if (target.mobile) mute.dataset.owsMobile = "1";
     mute.className = "ows-mute";
     mute.innerHTML = SPEAKER_ON_SVG;
     mute.addEventListener("click", (event) => {
@@ -147,14 +157,15 @@ export class Cockpit {
       this.callbacks.onToggleMute();
     });
 
-    const submit = actions.querySelector('[data-action="composer-submit"]');
-    if (submit) {
-      actions.insertBefore(button, submit);
-      actions.insertBefore(mute, submit);
+    const anchor = target.anchor;
+    if (anchor) {
+      target.actions.insertBefore(button, anchor);
+      target.actions.insertBefore(mute, anchor);
     } else {
-      actions.append(button, mute);
+      target.actions.append(button, mute);
     }
-    this.mountStripNear(composer);
+    this.mountParent = target.actions;
+    this.mountStripNear(this.composer);
     this.button = button;
     this.muteButton = mute;
     this.paint();
@@ -360,6 +371,8 @@ export class Cockpit {
 
   destroy() {
     this.observer?.disconnect();
+    if (this.resizeHandler) window.removeEventListener("resize", this.resizeHandler);
+    this.resizeHandler = undefined;
     this.attachScheduled = false;
     if (this.injectTimer) window.clearInterval(this.injectTimer);
     this.button?.remove();
@@ -368,6 +381,42 @@ export class Cockpit {
     this.composer?.classList.remove("ows-composer-live");
     document.getElementById(STYLE_ID)?.remove();
   }
+}
+
+function isVisibleElement(el: Element | null | undefined): el is HTMLElement {
+  if (!(el instanceof HTMLElement)) return false;
+  const style = getComputedStyle(el);
+  if (style.display === "none" || style.visibility === "hidden") return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+
+function resolveVisibleMount(composer: HTMLElement | null): { actions: HTMLElement; anchor: Element | null; mobile: boolean } | null {
+  const submits = [...document.querySelectorAll<HTMLElement>('[data-action="composer-submit"]')].filter(isVisibleElement);
+  for (const submit of submits) {
+    const desktopSlot = submit.closest<HTMLElement>('[data-slot="composer-actions"]');
+    if (desktopSlot && isVisibleElement(desktopSlot)) {
+      let anchor: HTMLElement = submit;
+      while (anchor.parentElement && anchor.parentElement !== desktopSlot) anchor = anchor.parentElement;
+      return { actions: desktopSlot, anchor, mobile: false };
+    }
+    const parent = submit.parentElement;
+    if (!parent) continue;
+    const alt = parent.querySelector('[data-action="composer-alternate-delivery"]');
+    return {
+      actions: parent,
+      anchor: alt && isVisibleElement(alt) ? alt : submit,
+      mobile: true,
+    };
+  }
+  if (!composer) return null;
+  const actions =
+    composer.querySelector<HTMLElement>('[data-slot="composer-actions"]') ??
+    composer.querySelector<HTMLElement>('[data-action="prompt-attach"]')?.parentElement ??
+    composer.querySelector<HTMLElement>('[data-component="prompt-agent-control"]')?.parentElement ??
+    composer;
+  if (!isVisibleElement(actions)) return null;
+  return { actions, anchor: actions.querySelector('[data-action="composer-submit"]'), mobile: false };
 }
 
 /**
@@ -448,56 +497,61 @@ function injectStyle() {
     @keyframes ows-think { 0%,100% { height: 5px; opacity: .5; } 50% { height: 9px; opacity: 1; } }
     @keyframes ows-wait { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
 
-    .ows-composer-live { box-shadow: 0 0 0 1.5px rgba(14,165,183,.45), 0 0 16px rgba(14,165,183,.15) !important; }
+    .ows-button[data-ows-mobile="1"], .ows-mute[data-ows-mobile="1"] {
+      width: 40px; height: 40px; padding: 8px; border-radius: 8px;
+    }
+    .ows-composer-live { box-shadow: 0 0 0 1px var(--v2-border-border-focus, rgba(14,165,183,.55)) !important; }
 
     .ows-strip {
       position: fixed; left: 50%; bottom: 12px; transform: translateX(-50%) translateY(140%);
       z-index: 2147483000; max-width: min(760px, calc(100vw - 24px)); width: max-content;
-      background: rgba(20, 22, 27, .94); color: #e8e8ea;
-      border: 1px solid rgba(255, 255, 255, .14);
-      border-radius: 12px; box-shadow: 0 10px 34px rgba(0,0,0,.35);
-      backdrop-filter: blur(10px); opacity: 0; pointer-events: none;
+      background: var(--v2-background-bg-layer-01, var(--v2-background-bg-base, Canvas));
+      color: var(--v2-text-text-base, CanvasText);
+      border: 1px solid var(--v2-border-border-base, var(--v2-border-border-muted, rgba(128,128,128,.22)));
+      border-radius: 12px;
+      box-shadow: var(--v2-elevation-raised, var(--v2-elevation-floating, 0 8px 24px rgba(0,0,0,.18)));
+      opacity: 0; pointer-events: none;
       transition: transform .22s cubic-bezier(.2,.9,.3,1), opacity .18s ease;
-      font: 400 12.5px/1.4 ui-sans-serif, system-ui, sans-serif;
+      font: 400 12.5px/1.4 var(--font-family-text, ui-sans-serif, system-ui, sans-serif);
     }
     .ows-strip.ows-strip-docked {
-      position: absolute; left: 10px; right: 10px; bottom: calc(100% + 8px);
+      position: absolute; left: 0; right: 0; bottom: calc(100% + 8px);
       width: auto; max-width: none; transform: translateY(8px); z-index: 42;
     }
     .ows-strip.is-visible { transform: translateX(-50%) translateY(0); opacity: 1; pointer-events: auto; }
     .ows-strip.ows-strip-docked.is-visible { transform: translateY(0); }
-    .ows-strip-inner { display: flex; align-items: flex-start; gap: 10px; padding: 9px 12px; }
+    .ows-strip-inner { display: flex; align-items: flex-start; gap: 10px; padding: 8px 12px; }
     .ows-lines { display: grid; gap: 4px; min-width: 0; flex: 1 1 auto; }
     .ows-lines p { margin: 0; overflow-wrap: anywhere; }
-    .ows-meter { width: 3px; align-self: stretch; min-height: 26px; border-radius: 2px; background: color-mix(in srgb, CanvasText 12%, transparent); overflow: hidden; }
-    .ows-meter-fill { display: block; width: 100%; height: 100%; background: #0ea5b7; transform-origin: bottom; transform: scaleX(.02); transition: transform .08s linear; }
+    .ows-meter { width: 3px; align-self: stretch; min-height: 24px; border-radius: 2px; background: var(--v2-background-bg-layer-03, rgba(128,128,128,.16)); overflow: hidden; }
+    .ows-meter-fill { display: block; width: 100%; height: 100%; background: var(--v2-icon-icon-accent, #0ea5b7); transform-origin: bottom; transform: scaleX(.02); transition: transform .08s linear; }
 
-    .ows-tag { display: inline-block; font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
-      padding: 1px 6px; border-radius: 999px; margin-right: 6px; vertical-align: 1px;
-      background: color-mix(in srgb, CanvasText 12%, transparent); opacity: .85; }
-    .ows-tag-say { background: rgba(124,58,237,.2); color: #7c3aed; }
-    .ows-tag-inject { background: rgba(14,165,183,.2); color: #0e7490; }
-    .ows-raw { opacity: .6; text-decoration: line-through dotted; }
-    .ows-arrow { opacity: .55; margin: 0 3px; }
-    .ows-decision { opacity: .45; font-size: 11px; margin-left: 6px; }
-    .ows-saying { opacity: .95; }
+    .ows-tag { display: inline-block; font-size: 10px; font-weight: 500; letter-spacing: .06em; text-transform: uppercase;
+      padding: 1px 6px; border-radius: 6px; margin-right: 6px; vertical-align: 1px;
+      background: var(--v2-background-bg-layer-02, rgba(128,128,128,.14)); color: var(--v2-text-text-muted, inherit); }
+    .ows-tag-say { background: rgba(124,58,237,.16); color: #7c3aed; }
+    .ows-tag-inject { background: rgba(14,165,183,.16); color: #0e7490; }
+    .ows-raw { color: var(--v2-text-text-muted, inherit); opacity: .7; text-decoration: line-through dotted; }
+    .ows-arrow { color: var(--v2-text-text-muted, inherit); opacity: .65; margin: 0 3px; }
+    .ows-decision { color: var(--v2-text-text-muted, inherit); opacity: .65; font-size: 11px; margin-left: 6px; }
+    .ows-saying { color: var(--v2-text-text-base, inherit); }
     .ows-inject { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .ows-inject-text { font-weight: 500; }
 
     .ows-actions { display: flex; gap: 4px; align-self: center; flex: 0 0 auto; }
-    .ows-chip { font: inherit; font-size: 11px; padding: 3px 8px; border-radius: 999px; cursor: pointer;
-      background: transparent; color: inherit; opacity: .7;
-      border: 1px solid color-mix(in srgb, CanvasText 22%, transparent); }
-    .ows-chip:hover { opacity: 1; background: color-mix(in srgb, CanvasText 8%, transparent); }
-    .ows-chip.is-on { background: rgba(14,165,183,.18); border-color: rgba(14,165,183,.5); opacity: 1; }
-    .ows-chip-stop:hover { border-color: rgba(220,38,38,.6); color: #dc2626; }
-    .ows-chip-lang { font-family: ui-monospace, monospace; letter-spacing: .04em; min-width: 3.4em; text-align: center; }
+    .ows-chip { font: inherit; font-size: 11px; padding: 3px 8px; border-radius: 8px; cursor: pointer;
+      background: var(--v2-background-bg-layer-02, transparent); color: var(--v2-text-text-muted, inherit);
+      border: 1px solid var(--v2-border-border-muted, rgba(128,128,128,.22));
+      transition: background .14s ease, color .14s ease, border-color .14s ease; }
+    .ows-chip:hover { color: var(--v2-text-text-base, inherit); background: var(--v2-background-bg-layer-03, rgba(128,128,128,.12)); }
+    .ows-chip.is-on { color: var(--v2-text-text-base, inherit); background: var(--v2-background-bg-layer-03, rgba(14,165,183,.14)); border-color: var(--v2-border-border-strong, rgba(14,165,183,.45)); }
+    .ows-chip-stop:hover { border-color: rgba(220,38,38,.55); color: #dc2626; }
+    .ows-chip-lang { font-family: var(--font-family-mono, ui-monospace, monospace); letter-spacing: .04em; min-width: 3.2em; text-align: center; }
     .ows-chip-cancel { border-color: rgba(220,38,38,.45); }
 
     @media (pointer: coarse), (max-width: 640px) {
-      .ows-button, .ows-mute { width: 32px; height: 32px; padding: 6px; }
       .ows-strip { left: 8px; right: 8px; transform: translateY(140%); width: auto; max-width: none; }
-      .ows-strip.ows-strip-docked { left: 4px; right: 4px; bottom: calc(100% + 6px); }
+      .ows-strip.ows-strip-docked { left: 8px; right: 8px; bottom: calc(100% + 6px); }
       .ows-strip.is-visible { transform: translateY(0); }
       .ows-strip-inner { flex-wrap: wrap; gap: 8px; padding: 8px 10px; }
       .ows-actions { flex-wrap: wrap; width: 100%; justify-content: flex-end; }

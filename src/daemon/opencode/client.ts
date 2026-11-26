@@ -152,6 +152,22 @@ export class OpencodeClient {
     return this.request<SessionInfo>("GET", `/session/${encodeURIComponent(sessionID)}`, { directory });
   }
 
+  async setSessionAgent(sessionID: string, directory: string, agent: string): Promise<void> {
+    if ((await this.resolveMode()) !== "v2") return;
+    await this.request<unknown>("POST", `/api/session/${encodeURIComponent(sessionID)}/agent`, {
+      directory,
+      body: { agent },
+    });
+  }
+
+  async setSessionModel(sessionID: string, directory: string, model: ModelRef): Promise<void> {
+    if ((await this.resolveMode()) !== "v2") return;
+    await this.request<unknown>("POST", `/api/session/${encodeURIComponent(sessionID)}/model`, {
+      directory,
+      body: { model: { providerID: model.providerID, id: model.modelID } },
+    });
+  }
+
   async listSessions(directory: string): Promise<SessionInfo[]> {
     if ((await this.resolveMode()) === "v2") {
       const raw = await this.request<{ data?: Array<Record<string, unknown>> }>("GET", "/api/session", { directory });
@@ -216,7 +232,7 @@ export class OpencodeClient {
       if (body.noReply) {
         const raw = await this.request<{ data?: Record<string, unknown> }>("POST", `/api/session/${encodeURIComponent(sessionID)}/synthetic`, {
           directory,
-          body: { text },
+          body: { text, resume: false },
           timeoutMs: opts.timeoutMs ?? 30000,
           signal: opts.signal,
         });
@@ -224,29 +240,38 @@ export class OpencodeClient {
       }
       const before = await this.messages(sessionID, directory, 10).catch(() => []);
       const seenIds = new Set(before.map((m) => m.info.id));
-      await this.request<unknown>("POST", `/api/session/${encodeURIComponent(sessionID)}/prompt`, {
-        directory,
-        body: {
-          text,
-          agent: body.agent,
-          model: body.model ? { providerID: body.model.providerID, id: body.model.modelID } : undefined,
+      const fallbackStart = Date.now() - 250;
+      const promptRes = await this.request<{ data?: { time?: { created?: number } } }>(
+        "POST",
+        `/api/session/${encodeURIComponent(sessionID)}/prompt`,
+        {
+          directory,
+          body: { text },
+          timeoutMs: opts.timeoutMs ?? 120000,
+          signal: opts.signal,
         },
-        timeoutMs: opts.timeoutMs ?? 120000,
-        signal: opts.signal,
-      });
+      );
+      const promptCreatedAt =
+        typeof promptRes?.data?.time?.created === "number" ? promptRes.data.time.created : fallbackStart;
       // Poll briefly for the completed assistant message created by this prompt.
       const deadline = Date.now() + (opts.timeoutMs ?? 20000);
       while (Date.now() < deadline && !opts.signal?.aborted) {
         const latest = await this.messages(sessionID, directory, 6).catch(() => []);
         const reply = [...latest]
           .reverse()
-          .find((m) => m.info.role === "assistant" && !seenIds.has(m.info.id) && m.info.time.completed);
+          .find(
+            (m) =>
+              m.info.role === "assistant" &&
+              !seenIds.has(m.info.id) &&
+              m.info.time.created >= promptCreatedAt &&
+              m.info.time.completed,
+          );
         if (reply) return reply;
-        await sleep(120, opts.signal);
+        await sleep(60, opts.signal);
       }
       const fallback = (await this.messages(sessionID, directory, 4).catch(() => []))
         .reverse()
-        .find((m) => m.info.role === "assistant" && !seenIds.has(m.info.id));
+        .find((m) => m.info.role === "assistant" && !seenIds.has(m.info.id) && m.info.time.created >= promptCreatedAt);
       return fallback ?? { info: { id: "", sessionID, role: "assistant", time: { created: Date.now() } }, parts: [] };
     }
 

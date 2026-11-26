@@ -54,6 +54,7 @@ export class BrowserRecognizer {
   private wantRunning = false;
   private restartTimer?: number;
   private consecutiveErrors = 0;
+  private generation = 0;
   private lang = "fr-FR";
   private phrases: string[] = [];
   supportsBiasing = false;
@@ -72,6 +73,20 @@ export class BrowserRecognizer {
   setLang(lang: string) {
     this.lang = lang;
     if (this.recognition) this.recognition.lang = lang;
+  }
+
+  /** Cleanly restart recognition with a new language without racing Chromium's mic teardown. */
+  restartWithLang(lang: string) {
+    this.lang = lang;
+    const wasRunning = this.wantRunning;
+    this.stop();
+    if (!wasRunning) return;
+    this.wantRunning = true;
+    const seq = this.generation;
+    this.restartTimer = window.setTimeout(() => {
+      this.restartTimer = undefined;
+      if (this.wantRunning && seq === this.generation) this.spawn();
+    }, 140);
   }
 
   /**
@@ -113,6 +128,7 @@ export class BrowserRecognizer {
       this.events.onError("unsupported");
       return;
     }
+    const seq = ++this.generation;
     const recognition = new Ctor();
     recognition.continuous = true;
     recognition.interimResults = true;
@@ -120,6 +136,7 @@ export class BrowserRecognizer {
     recognition.maxAlternatives = 1;
     this.applyPhrases(recognition);
     recognition.onresult = (event) => {
+      if (seq !== this.generation) return;
       let interim = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const result = event.results[i];
@@ -135,6 +152,7 @@ export class BrowserRecognizer {
       if (interim.trim()) this.events.onInterim(interim.trim());
     };
     recognition.onerror = (event) => {
+      if (seq !== this.generation) return;
       const error = event.error || "unknown";
       // Silence and manual stops are normal operation, not failures.
       if (error === "no-speech" || error === "aborted") return;
@@ -144,6 +162,7 @@ export class BrowserRecognizer {
       if (error === "not-allowed" || error === "service-not-allowed") this.wantRunning = false;
     };
     recognition.onend = () => {
+      if (seq !== this.generation) return;
       this.recognition = undefined;
       if (!this.wantRunning) return;
       // Back off only after repeated failures; a clean end restarts at once.
@@ -185,6 +204,7 @@ export class BrowserRecognizer {
   }
 
   stop() {
+    this.generation += 1;
     this.wantRunning = false;
     if (this.restartTimer) window.clearTimeout(this.restartTimer);
     this.restartTimer = undefined;

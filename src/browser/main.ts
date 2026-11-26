@@ -136,6 +136,10 @@ class CockpitApp {
       // The user picked another project in the new-session UI: re-resolve.
       if (event.key === TABS_KEY || event.key === TABS_INFO_KEY) this.syncSession();
     });
+    window.addEventListener("kpihx-voice-lang-change", (event) => {
+      const lang = (event as CustomEvent<string>).detail;
+      if (lang) this.setLanguage(lang, false);
+    });
 
     // Audio needs a gesture; take the first one the page gets.
     const unlock = () => void this.unlockAudio();
@@ -257,10 +261,7 @@ class CockpitApp {
     }
     this.player.setLang(this.recognizerLang());
     if (this.recognizer) {
-      this.recognizer.setLang(this.recognizerLang());
-      // A running recognizer keeps its language; restart it with the new one.
-      this.recognizer.stop();
-      this.recognizer.start();
+      this.recognizer.restartWithLang(this.recognizerLang());
     }
     this.link.send({ type: "prefs", sessionID: this.sessionID, lang: this.transcriptLang() });
     this.ui.update({ lang: next });

@@ -71,7 +71,13 @@ export class StreamerSession {
     const existing = this.registry.binding(this.mainSessionID);
     if (existing) {
       try {
-        await this.client.getSession(existing.streamerID, existing.directory);
+        const info = await this.client.getSession(existing.streamerID, existing.directory);
+        if (info.agent !== this.opts.agent) {
+          await this.client.setSessionAgent(existing.streamerID, existing.directory, this.opts.agent).catch(() => undefined);
+        }
+        if (this.modelRef) {
+          await this.client.setSessionModel(existing.streamerID, existing.directory, this.modelRef).catch(() => undefined);
+        }
         this.hooks.onStreamerID(existing.streamerID);
         return existing.streamerID;
       } catch (e) {
@@ -81,7 +87,11 @@ export class StreamerSession {
       }
     }
     const title = `${this.opts.titlePrefix ?? "🎙 streamer"} · ${this.mainTitle || this.mainSessionID}`.slice(0, 120);
-    const created = await this.client.createSession(this.directory, { title });
+    const created = await this.client.createSession(this.directory, {
+      title,
+      agent: this.opts.agent,
+      model: this.modelRef,
+    });
     this.registry.bind(this.mainSessionID, {
       streamerID: created.id,
       directory: this.directory,

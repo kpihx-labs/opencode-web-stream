@@ -118,13 +118,13 @@ export const DEFAULTS: Config = {
   },
   decision: {
     enabled: true,
-    url: "http://127.0.0.1:11437/v1/chat/completions",
-    model: "qwen3-0.6b",
-    timeoutMs: 2500,
+    url: "http://127.0.0.1:11435/v1/systemone",
+    model: "largha",
+    timeoutMs: 800,
   },
   streamer: {
     agent: "streamer",
-    model: "opencode-go/hy4-flash-free",
+    model: "opencode/deepseek-v4.1-flash-free",
     beatTimeoutMs: 9000,
     voiceTimeoutMs: 20000,
     summarizeEveryPrompts: 80,

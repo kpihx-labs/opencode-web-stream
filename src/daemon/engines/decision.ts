@@ -2,19 +2,36 @@ import type { Config } from "../config.js";
 import type { ScopedLogger } from "../log.js";
 
 /**
- * Fast local/free System-One decision gate replacing paid external routers.
+ * Instant System-One decision gate backed by Ollaya (`largha` / `laya` ONNX
+ * encoder models, TypeSafe `/v1/systemone` wire contract).
  *
- * Calls an OpenAI-compatible small local model (default: OpenVINO `qwen3-0.6b`
- * on 127.0.0.1:11437 with `enable_thinking: false`) using strict JSON output
- * to make sub-300ms triage decisions (stop/noise barge-in or low-salience beat
- * skip). When unavailable, gracefully returns `pass` so the main `streamer`
- * agent handles everything without stalls.
+ * Single forward pass, zero text generation, zero thinking: ~45 ms per
+ * classification with calibrated `Choice` and `Noul` probabilities. When
+ * offline, gracefully returns `pass` / `true` so the main `streamer` agent
+ * handles everything without blocking.
  */
 
 export type VoiceTriage = "stop" | "noise" | "pass";
 
+type ChoiceAnswer = {
+  type: "choice";
+  choice?: string;
+  confidence?: number;
+  probabilities?: Record<string, number>;
+};
+
+type NoulAnswer = {
+  type: "noul";
+  noul?: number;
+};
+
+type SystemOneResponse = {
+  answers?: Record<string, ChoiceAnswer | NoulAnswer>;
+};
+
 export class DecisionEngine {
   private ready = false;
+  private warmed = false;
   private lastCheck = 0;
   private checking?: Promise<boolean>;
 
@@ -44,15 +61,15 @@ export class DecisionEngine {
     this.checking = (async () => {
       const origin = originOf(this.cfg.url);
       let ok = false;
-      for (const probe of [`${origin}/v1/models`, `${origin}/health`]) {
+      for (const probe of [`${origin}/v1/models`, `${origin}/`]) {
         try {
-          const res = await this.fetchImpl(probe, { signal: AbortSignal.timeout(1500) });
+          const res = await this.fetchImpl(probe, { signal: AbortSignal.timeout(1200) });
           if (res.ok) {
             ok = true;
             break;
           }
         } catch {
-          // next
+          // next probe
         }
       }
       this.lastCheck = Date.now();
@@ -63,67 +80,84 @@ export class DecisionEngine {
         });
       }
       this.ready = ok;
+      if (ok && !this.warmed) {
+        this.warmed = true;
+        void this.warmup();
+      }
       this.checking = undefined;
       return ok;
     })();
     return this.checking;
   }
 
-  /** Sub-300ms triage of a spoken utterance during live playback or idle. */
+  private async warmup() {
+    await this.askSystemOne(
+      'speaking=false text="ok"',
+      {
+        intent: {
+          type: "choice",
+          instructions: "Warmup classification.",
+          criteria: { stop: "stop", pass: "pass" },
+        },
+      },
+      5000,
+    );
+  }
+
+  /** ~45 ms calibrated triage of a spoken utterance via Ollaya System One. */
   async triageVoice(transcript: string, ctx: { speaking: boolean; busy: boolean }): Promise<VoiceTriage> {
     if (!(await this.check())) return "pass";
-    const system =
-      "/no_think\nClassify user voice input for a coding assistant. Reply ONLY single-line JSON {\"intent\":\"stop|noise|pass\"} with no markdown. " +
-      "stop=user only tells the voice to stop/shut up/be quiet (no coding task). " +
-      "noise=cough, filler, garbled 1-2 syllables. " +
-      "pass=any question, instruction, feedback, confirmation, or unclear speech. " +
-      "Examples: \"tais-toi\"->{\"intent\":\"stop\"}; \"euh\"->{\"intent\":\"noise\"}; \"ajoute un test\"->{\"intent\":\"pass\"}.";
-    const user = `speaking=${ctx.speaking} busy=${ctx.busy} text=${JSON.stringify(transcript)}`;
-    const json = await this.askJson<{ intent?: string }>(system, user);
-    if (!json) return "pass";
-    if (json.intent === "stop" || json.intent === "noise") return json.intent;
+    const res = await this.askSystemOne(`speaking=${ctx.speaking} busy=${ctx.busy} text=${JSON.stringify(transcript)}`, {
+      intent: {
+        type: "choice",
+        instructions: "Classify the user voice utterance while using a live coding assistant.",
+        criteria: {
+          stop: "The user ONLY tells the voice/assistant to stop talking, shut up, pause, or be quiet (e.g. tais-toi, stop, arrete, shut up), with no coding instruction.",
+          noise: "Meaningless filler, cough, breath, garbled syllable (e.g. euh, hmm, uh) not meant as communication.",
+          pass: "A greeting, question, instruction, feedback, answer, or anything directed at the assistant (e.g. bonjour, ajoute un test, ok).",
+        },
+      },
+    });
+    const ans = res?.answers?.intent as ChoiceAnswer | undefined;
+    if (!ans || ans.type !== "choice") return "pass";
+    const probs = ans.probabilities ?? {};
+    if (ans.choice === "stop" && (probs.stop ?? 0) >= 0.4) return "stop";
+    if (ans.choice === "noise" && (probs.noise ?? 0) >= 0.42) return "noise";
     return "pass";
   }
 
-  /** Fast pre-filter for tool beats: skip pure noisy read/list bursts with no insight. */
+  /** ~45 ms calibrated salience gate for short tool-activity beats. */
   async triageBeat(summary: string): Promise<boolean> {
     if (!(await this.check())) return true;
-    const system =
-      "/no_think\nDecide if this tool-activity summary is worth speaking aloud briefly to the user, or too minor/repetitive to interrupt. " +
-      "Reply ONLY single-line JSON {\"speak\":true|false} with no markdown.";
-    const json = await this.askJson<{ speak?: boolean }>(system, summary.slice(0, 600));
-    if (!json || typeof json.speak !== "boolean") return true;
-    return json.speak;
+    const res = await this.askSystemOne(summary.slice(0, 600), {
+      worth_speaking: {
+        type: "noul",
+        instructions: "Is this tool-activity summary important or unexpected enough to interrupt and speak aloud to the developer, rather than routine file reading or listing?",
+      },
+    });
+    const ans = res?.answers?.worth_speaking as NoulAnswer | undefined;
+    if (!ans || ans.type !== "noul" || typeof ans.noul !== "number") return true;
+    return ans.noul >= 0.4;
   }
 
-  private async askJson<T>(system: string, user: string): Promise<T | undefined> {
+  private async askSystemOne(
+    state: string,
+    questions: Record<string, unknown>,
+    timeoutOverrideMs?: number,
+  ): Promise<SystemOneResponse | undefined> {
     try {
       const res = await this.fetchImpl(this.cfg.url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           model: this.cfg.model,
-          temperature: 0,
-          max_tokens: 48,
-          chat_template_kwargs: { enable_thinking: false },
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: user },
-          ],
+          state,
+          questions,
         }),
-        signal: AbortSignal.timeout(this.cfg.timeoutMs),
+        signal: AbortSignal.timeout(timeoutOverrideMs ?? this.cfg.timeoutMs),
       });
       if (!res.ok) return undefined;
-      const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-      const raw = data.choices?.[0]?.message?.content ?? "";
-      const cleaned = raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-      const match = cleaned.match(/\{[\s\S]*\}/);
-      if (match) return JSON.parse(match[0]) as T;
-      const intent = cleaned.match(/"intent"\s*:\s*"(stop|noise|pass)"/i)?.[1]?.toLowerCase();
-      if (intent) return { intent } as unknown as T;
-      const speak = cleaned.match(/"speak"\s*:\s*(true|false)/i)?.[1]?.toLowerCase();
-      if (speak) return { speak: speak === "true" } as unknown as T;
-      return undefined;
+      return (await res.json()) as SystemOneResponse;
     } catch {
       return undefined;
     }
