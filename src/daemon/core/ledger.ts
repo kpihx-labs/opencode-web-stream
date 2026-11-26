@@ -46,6 +46,9 @@ export type ChatNote = {
 
 export class ExecutionLedger {
   status: SessionStatus["type"] = "idle";
+  agent?: string;
+  modelKey?: string;
+  directory?: string;
   busySince = 0;
   lastActivityAt = 0;
   lastSpokenAt = 0;
@@ -55,6 +58,12 @@ export class ExecutionLedger {
   readonly subagents = new Map<string, SubagentInfo>();
   readonly recentTools: CompletedTool[] = [];
   readonly chatNotes: ChatNote[] = [];
+
+  setMeta(meta: { agent?: string; modelKey?: string; directory?: string }) {
+    if (meta.agent !== undefined) this.agent = meta.agent;
+    if (meta.modelKey !== undefined) this.modelKey = meta.modelKey;
+    if (meta.directory !== undefined) this.directory = meta.directory;
+  }
 
   setTask(task: string, now = Date.now()) {
     const clean = task.trim();
@@ -222,6 +231,9 @@ export class ExecutionLedger {
   } = {}): string {
     const now = opts.now ?? Date.now();
     const lines: string[] = ["[LIVE STATE]"];
+    if (this.agent) lines.push(`active_agent: ${this.agent}`);
+    if (this.modelKey) lines.push(`active_model: ${this.modelKey}`);
+    if (this.directory) lines.push(`directory: ${this.directory}`);
     if (this.status === "idle" && !this.hasActiveWork()) {
       lines.push("session_status: idle");
     } else {

@@ -68,6 +68,7 @@ class CockpitApp {
   /** Two-letter codes the daemon is configured for; the chip cycles through these plus "auto". */
   private languages: string[] = ["fr", "en"];
   private voicePluginSelect?: HTMLSelectElement;
+  private lastMetaKey = "";
   private destroyed = false;
 
   constructor() {
@@ -122,9 +123,12 @@ class CockpitApp {
     this.link = new DaemonLink({
       onMessage: (msg) => this.onServerMessage(msg),
       onOpen: () => {
+        const meta = this.currentUiMeta();
         this.ui.update({ connected: true });
-        this.link.attach(this.sessionID, this.directory, !document.hidden);
-        if (this.live) this.link.send({ type: "live", sessionID: this.sessionID, enabled: true });
+        this.link.attach(this.sessionID, this.directory, !document.hidden, meta);
+        if (this.live) {
+          this.link.send({ type: "live", sessionID: this.sessionID, enabled: true, directory: this.directory || undefined, lang: this.transcriptLang(), ...meta });
+        }
       },
       onClose: () => this.ui.update({ connected: false }),
     });
@@ -144,8 +148,9 @@ class CockpitApp {
       if (event.key === VOICE_PLUGIN_LANG_KEY || event.key === V2_VOICE_LANG_KEY || event.key === LANG_KEY) {
         this.setLanguage(resolveLanguagePreference(), false);
       }
-      // The user picked another project in the new-session UI: re-resolve.
+      // The user picked another project or changed agent/model in the UI: sync immediately.
       if (event.key === TABS_KEY || event.key === TABS_INFO_KEY) this.syncSession();
+      if (event.key?.includes("model-selection")) this.syncMeta();
     });
     window.addEventListener("kpihx-voice-lang-change", (event) => {
       const lang = (event as CustomEvent<string>).detail;
@@ -176,23 +181,44 @@ class CockpitApp {
     }
   }
 
+  private currentUiMeta(): { agent?: string; model?: { providerID: string; modelID: string } } {
+    return resolveUiMeta(this.sessionID, this.directory);
+  }
+
+  private syncMeta(force = false) {
+    const meta = this.currentUiMeta();
+    const key = `${this.sessionID}|${meta.agent ?? ""}|${meta.model?.providerID ?? ""}/${meta.model?.modelID ?? ""}`;
+    if (!force && key === this.lastMetaKey) return;
+    this.lastMetaKey = key;
+    if (!meta.agent && !meta.model) return;
+    if (this.sessionID) {
+      this.link.send({ type: "prefs", sessionID: this.sessionID, ...meta });
+    } else {
+      this.link.attach(this.sessionID, this.directory, !document.hidden, meta);
+    }
+  }
+
   private syncSession() {
     const next = sessionIdFromLocation();
     const nextDirectory = resolveWorkspaceDirectory(next);
     if (nextDirectory && nextDirectory !== this.directory) {
       this.directory = nextDirectory;
-      this.link.attach(this.sessionID, this.directory, !document.hidden);
+      const meta = this.currentUiMeta();
+      this.link.attach(this.sessionID, this.directory, !document.hidden, meta);
       this.refreshDirState();
       if (this.live) {
-        this.link.send({ type: "live", sessionID: this.sessionID, enabled: true, directory: this.directory, lang: this.transcriptLang() });
+        this.link.send({ type: "live", sessionID: this.sessionID, enabled: true, directory: this.directory, lang: this.transcriptLang(), ...meta });
       }
     }
-    if (next === this.sessionID) return;
+    if (next === this.sessionID) {
+      this.syncMeta();
+      return;
+    }
     // Arriving on a session we just created: keep listening, do not tear down.
     if (next && this.sessionID === "") {
       log.info("new session materialised", { sessionID: next, directory: this.directory });
       this.sessionID = next;
-      this.link.attach(next, this.directory, !document.hidden);
+      this.link.attach(next, this.directory, !document.hidden, this.currentUiMeta());
       return;
     }
     log.info("session changed", { from: this.sessionID || "(new)", to: next || "(new-session)", directory: nextDirectory });
@@ -205,8 +231,9 @@ class CockpitApp {
     this.player.cancel();
     this.sessionID = next;
     if (nextDirectory) this.directory = nextDirectory;
+    this.lastMetaKey = "";
     this.refreshDirState();
-    this.link.attach(next, this.directory, !document.hidden);
+    this.link.attach(next, this.directory, !document.hidden, this.currentUiMeta());
     if (wasLive) void this.toggleLive(true);
   }
 
@@ -329,7 +356,8 @@ class CockpitApp {
     this.live = next;
     writeFlag(LIVE_KEY, next);
     this.ui.update({ live: next, state: next ? "listening" : "idle" });
-    this.link.send({ type: "live", sessionID: this.sessionID, enabled: next, directory: this.directory, lang: this.transcriptLang() });
+    const meta = this.currentUiMeta();
+    this.link.send({ type: "live", sessionID: this.sessionID, enabled: next, directory: this.directory, lang: this.transcriptLang(), ...meta });
     if (next) {
       await this.unlockAudio();
       await this.startListening();
@@ -461,9 +489,10 @@ class CockpitApp {
     this.ui.update({ state: "thinking" });
     let shouldCheckResume = false;
     try {
+      const uiMeta = this.currentUiMeta();
       const result = await postAudio(
         blob,
-        { sessionID: this.sessionID, directory: this.directory, lang: this.transcriptLang(), bargeIn, spokenOver: context.spokenOver, apply: true },
+        { sessionID: this.sessionID, directory: this.directory, lang: this.transcriptLang(), bargeIn, spokenOver: context.spokenOver, apply: true, ...uiMeta },
         controller.signal,
       );
       if (!result.text || result.decision === "echo" || result.decision === "quiet") {
@@ -526,6 +555,7 @@ class CockpitApp {
       context = { bargeIn: true, spokenOver: heard || context.spokenOver };
     }
     this.ui.update({ state: "thinking" });
+    const meta = this.currentUiMeta();
     this.link.send({
       type: "transcript",
       sessionID: this.sessionID,
@@ -535,6 +565,7 @@ class CockpitApp {
       // The browser recognizer always ran in one concrete language.
       lang: this.recognizerLang(),
       directory: this.directory,
+      ...meta,
     });
   }
 
@@ -645,9 +676,12 @@ class CockpitApp {
    */
   private followNavigation(sessionID: string, directory: string, url: string) {
     const targetUrl = resolveSessionTargetUrl(sessionID, url);
-    log.info("following the new session", { sessionID, url: targetUrl });
+    log.info("following the new session", { sessionID, directory, url: targetUrl });
     this.sessionID = sessionID;
-    if (directory) this.directory = directory;
+    if (directory && directory !== this.directory) {
+      this.directory = directory;
+      this.refreshDirState();
+    }
     if (sessionIdFromLocation() === sessionID) return;
     try {
       history.pushState({}, "", targetUrl);
@@ -809,6 +843,64 @@ function decodeBase64(value: string): string {
   } catch {
     return "";
   }
+}
+
+/**
+ * Read the live agent and model currently selected in OpenCode Web V2's UI
+ * (`workspace:model-selection` store + visible composer agent button) so even
+ * pre-prompt or new-session selections synchronize immediately to the daemon.
+ */
+export function resolveUiMeta(
+  sessionID: string,
+  directory: string,
+): { agent?: string; model?: { providerID: string; modelID: string } } {
+  let agent: string | undefined;
+  let model: { providerID: string; modelID: string } | undefined;
+  try {
+    const dirSlug = directory ? directory.replace(/[^a-zA-Z0-9]+/g, "-") : "";
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.endsWith(":workspace:model-selection")) keys.push(k);
+    }
+    // Prefer the workspace store matching the current directory slug.
+    keys.sort((a, b) => Number(Boolean(dirSlug && b.includes(dirSlug))) - Number(Boolean(dirSlug && a.includes(dirSlug))));
+    for (const k of keys) {
+      const raw = localStorage.getItem(k);
+      if (!raw) continue;
+      const parsed = JSON.parse(raw) as {
+        session?: Record<
+          string,
+          {
+            agent?: string;
+            choice?: { providerID?: string; modelID?: string };
+            choices?: Record<string, { providerID?: string; modelID?: string }>;
+          }
+        >;
+      };
+      const sessions = parsed?.session;
+      if (!sessions) continue;
+      const entry = (sessionID && sessions[sessionID]) || (!sessionID && (sessions.new || sessions.default)) || undefined;
+      if (!entry) continue;
+      if (typeof entry.agent === "string" && entry.agent.trim()) agent = entry.agent.trim();
+      const chosen = (agent && entry.choices?.[agent]) || entry.choice;
+      if (chosen?.providerID && chosen?.modelID) {
+        model = { providerID: chosen.providerID, modelID: chosen.modelID };
+      }
+      break;
+    }
+  } catch {
+    // ignore storage parse failures
+  }
+  try {
+    if (typeof document !== "undefined") {
+      const domAgent = document.querySelector<HTMLElement>('[data-component="prompt-agent-control"]')?.textContent?.trim();
+      if (domAgent && (!agent || agent === "build")) agent = domAgent;
+    }
+  } catch {
+    // ignore DOM access issues in unit tests
+  }
+  return { ...(agent ? { agent } : {}), ...(model ? { model } : {}) };
 }
 
 function readFlag(key: string, fallback: boolean): boolean {

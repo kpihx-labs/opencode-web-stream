@@ -44,7 +44,7 @@ export class StreamerSession {
 
   constructor(
     readonly mainSessionID: string,
-    readonly directory: string,
+    public directory: string,
     private mainTitle: string,
     private readonly client: OpencodeClient,
     private readonly registry: Registry,
@@ -75,6 +75,39 @@ export class StreamerSession {
   setMainModel(model: ModelRef | undefined) {
     if (!model?.providerID || !model?.modelID) return;
     this.mainModelRef = model;
+  }
+
+  /** Push main session model immediately to the bound streamer session when inheriting. */
+  async syncMainModel(model: ModelRef | undefined): Promise<void> {
+    if (!model?.providerID || !model?.modelID) return;
+    this.mainModelRef = model;
+    if (this.configuredModels.length > 0) return;
+    const sid = this.streamerID;
+    const key = `${model.providerID}/${model.modelID}`;
+    if (!sid || this.appliedModelKey === key) return;
+    try {
+      await this.client.setSessionModel(sid, this.directory, model);
+      this.appliedModelKey = key;
+      this.log.debug("streamer model synced", { main: this.mainSessionID, streamer: sid, model: key });
+    } catch (e) {
+      this.log.warn("streamer model sync failed", { main: this.mainSessionID, model: key, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  /** Move the bound streamer session into a new working directory alongside the main session. */
+  async moveDirectory(nextDir: string): Promise<void> {
+    if (!nextDir || nextDir === this.directory) return;
+    const prevDir = this.directory;
+    this.directory = nextDir;
+    const sid = this.streamerID;
+    this.registry.touch(this.mainSessionID, { directory: nextDir });
+    if (!sid) return;
+    try {
+      await this.client.moveSession(sid, prevDir, nextDir);
+      this.log.info("streamer directory moved", { main: this.mainSessionID, streamer: sid, from: prevDir, to: nextDir });
+    } catch (e) {
+      this.log.warn("streamer directory move failed", { main: this.mainSessionID, to: nextDir, error: e instanceof Error ? e.message : String(e) });
+    }
   }
 
   get streamerID(): string | undefined {

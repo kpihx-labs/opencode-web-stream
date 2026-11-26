@@ -86,6 +86,12 @@ export class Hub implements Outbound {
     for (const c of this.clients.values()) if (c.sessionID === sessionID) this.send(c, msg);
   }
 
+  updateDirectory(sessionID: string, directory: string) {
+    for (const c of this.clients.values()) {
+      if (c.sessionID === sessionID) c.directory = directory;
+    }
+  }
+
   /**
    * A cockpit that was on the new-session page now belongs to a real session.
    * Rebinding before sending means the notification and everything after it
@@ -191,7 +197,7 @@ export class Hub implements Outbound {
           if (msg.directory) client.directory = msg.directory;
           client.visible = msg.visible;
           client.attachedAt = Date.now();
-          this.orchestrator.prewarm(msg.sessionID, client.directory);
+          this.orchestrator.prewarm(msg.sessionID, client.directory, { agent: msg.agent, model: msg.model });
           const snap = msg.sessionID ? this.orchestrator.snapshot(msg.sessionID) : undefined;
           if (snap) {
             this.send(client, { type: "state", sessionID: msg.sessionID, state: snap.state, blocked: snap.blocked });
@@ -205,7 +211,10 @@ export class Hub implements Outbound {
         case "live": {
           client.sessionID = msg.sessionID;
           if (msg.directory) client.directory = msg.directory;
-          const snap = await this.orchestrator.setLive(msg.sessionID, msg.enabled, client.directory, msg.lang);
+          const snap = await this.orchestrator.setLive(msg.sessionID, msg.enabled, client.directory, msg.lang, {
+            agent: msg.agent,
+            model: msg.model,
+          });
           if (!snap) this.send(client, { type: "error", message: "no_directory" });
           else this.send(client, { type: "state", sessionID: msg.sessionID, state: snap.state, blocked: snap.blocked });
           this.broadcastStatus();
@@ -218,6 +227,8 @@ export class Hub implements Outbound {
             spokenOver: msg.spokenOver,
             lang: msg.lang,
             directory: msg.directory ?? client.directory,
+            agent: msg.agent,
+            model: msg.model,
           });
           return;
         case "barge_in":
@@ -230,7 +241,13 @@ export class Hub implements Outbound {
           this.orchestrator.onSpoken(msg.sessionID, msg.utteranceId, msg.completed, msg.heardText);
           return;
         case "prefs":
-          this.orchestrator.setPrefs(msg.sessionID, { digest: msg.digest, muted: msg.muted, lang: msg.lang });
+          this.orchestrator.setPrefs(msg.sessionID, {
+            digest: msg.digest,
+            muted: msg.muted,
+            lang: msg.lang,
+            agent: msg.agent,
+            model: msg.model,
+          });
           return;
         case "control": {
           const s = this.orchestrator.sessions.get(msg.sessionID);
@@ -368,6 +385,10 @@ export class Hub implements Outbound {
         const apply = url.searchParams.get("apply") !== "0";
         const bargeIn = url.searchParams.get("bargeIn") === "1";
         const spokenOver = url.searchParams.get("spokenOver") ?? undefined;
+        const agent = url.searchParams.get("agent") || undefined;
+        const modelRaw = url.searchParams.get("model") || "";
+        const slash = modelRaw.indexOf("/");
+        const model = slash > 0 && slash < modelRaw.length - 1 ? { providerID: modelRaw.slice(0, slash), modelID: modelRaw.slice(slash + 1) } : undefined;
         const mime = String(req.headers["content-type"] ?? "audio/wav").split(";")[0];
         const audio = await readBody(req, 25 * 1024 * 1024);
         if (audio.length < 250) {
@@ -384,7 +405,7 @@ export class Hub implements Outbound {
           const spoken = lang && lang !== "auto" ? lang : language;
           let decision: string | undefined;
           if (apply && text && (sessionID || directory)) {
-            decision = await this.orchestrator.onTranscript(sessionID, text, { bargeIn, spokenOver, lang: spoken, directory });
+            decision = await this.orchestrator.onTranscript(sessionID, text, { bargeIn, spokenOver, lang: spoken, directory, agent, model });
           }
           json(res, 200, { text, language: spoken, decision });
         } catch (e) {

@@ -37,6 +37,8 @@ import { IncrementalSpeechReader, parseStreamerOutput, type Decision } from "./t
 export type Outbound = {
   /** Send to every cockpit attached to the session. */
   toSession(sessionID: string, msg: ServerMessage): void;
+  /** Update tracked directory for cockpits attached to a moved session. */
+  updateDirectory?(sessionID: string, directory: string): void;
   /** Move every cockpit sitting on `from` onto `to`, then notify them. */
   rebind(from: string, to: string, msg: ServerMessage, directory?: string): void;
   /** Send to the cockpit currently elected speaker for the session (or a fallback in the directory). */
@@ -116,6 +118,11 @@ export class Orchestrator {
   private lastOpencodeError?: string;
   /** Directories where a cockpit armed live before any session existed. */
   private readonly pendingLive = new Set<string>();
+  /** Draft UI agent/model selection per directory before a new session materializes. */
+  private readonly pendingMetaByDir = new Map<string, { agent?: string; model?: { providerID: string; modelID: string } }>();
+  /** Cached agent descriptions from OpenCode `/api/agent`. */
+  private readonly agentDescriptions = new Map<string, string>();
+  private agentsLoaded = false;
 
   constructor(
     private readonly cfg: Config,
@@ -203,11 +210,24 @@ export class Orchestrator {
   }
 
   /** Pre-build lexicon and hydrate session metadata on cockpit attach for zero-delay startup. */
-  prewarm(sessionID: string, directory?: string) {
-    if (directory) void this.lexiconFor(directory);
-    if (!sessionID || this.isStreamer(sessionID)) return;
+  prewarm(sessionID: string, directory?: string, meta?: { agent?: string; model?: { providerID: string; modelID: string } }) {
+    if (directory) {
+      void this.lexiconFor(directory);
+      void this.ensureAgentDescriptions(directory);
+    }
+    if (!sessionID) {
+      if (directory && (meta?.agent || meta?.model)) {
+        const cur = this.pendingMetaByDir.get(directory) ?? {};
+        this.pendingMetaByDir.set(directory, { agent: meta.agent ?? cur.agent, model: meta.model ?? cur.model });
+      }
+      return;
+    }
+    if (this.isStreamer(sessionID)) return;
     const s = this.sessions.get(sessionID) ?? (directory ? this.ensureSession(sessionID, directory) : undefined);
-    if (s && !s.title && !s.lastAnswer) void this.hydrate(s);
+    if (s) {
+      if (!s.title && !s.lastAnswer) void this.hydrate(s);
+      if (meta?.agent || meta?.model) void this.syncClientMeta(s, meta);
+    }
   }
 
   snapshot(sessionID: string): SessionSnapshot | undefined {
@@ -223,6 +243,8 @@ export class Orchestrator {
       lastSpoken: s.lastSpoken,
       lastHeard: s.lastHeard,
       lang: s.lang,
+      agent: s.agent,
+      model: s.model,
       digest: s.prefs.digest,
     };
   }
@@ -236,7 +258,13 @@ export class Orchestrator {
 
   // ---- live toggling -------------------------------------------------------
 
-  async setLive(sessionID: string, enabled: boolean, directoryHint?: string, lang?: string): Promise<SessionSnapshot | undefined> {
+  async setLive(
+    sessionID: string,
+    enabled: boolean,
+    directoryHint?: string,
+    lang?: string,
+    meta?: { agent?: string; model?: { providerID: string; modelID: string } },
+  ): Promise<SessionSnapshot | undefined> {
     // The new-session page has no session yet. Live is armed against the
     // directory; the session itself is created the moment the user speaks.
     if (!sessionID) {
@@ -246,7 +274,12 @@ export class Orchestrator {
       }
       if (enabled) {
         this.pendingLive.add(directoryHint);
+        if (meta?.agent || meta?.model) {
+          const cur = this.pendingMetaByDir.get(directoryHint) ?? {};
+          this.pendingMetaByDir.set(directoryHint, { agent: meta.agent ?? cur.agent, model: meta.model ?? cur.model });
+        }
         void this.lexiconFor(directoryHint);
+        void this.ensureAgentDescriptions(directoryHint);
         this.log.info("live armed for a new session", { directory: directoryHint });
       } else {
         this.pendingLive.delete(directoryHint);
@@ -263,14 +296,20 @@ export class Orchestrator {
       }
       s = this.ensureSession(sessionID, directory);
     }
-    if (enabled === s.live) return this.snapshot(sessionID);
+    if (enabled === s.live) {
+      if (enabled && (meta?.agent || meta?.model)) void this.syncClientMeta(s, meta);
+      return this.snapshot(sessionID);
+    }
     s.live = enabled;
     if (enabled) {
       this.log.info("live on", { sessionID, directory: s.directory });
-      await Promise.all([this.hydrate(s), this.lexiconFor(s.directory)]);
+      await Promise.all([this.hydrate(s), this.lexiconFor(s.directory), this.ensureAgentDescriptions(s.directory)]);
       if (this.isStreamer(sessionID)) {
         s.live = false;
         return undefined;
+      }
+      if (meta?.agent || meta?.model) {
+        await this.syncClientMeta(s, meta, { pushToServer: true });
       }
       this.setPhase(s, s.status === "busy" ? "thinking" : "listening");
       if (s.status === "busy") this.syncProgressTimer(s);
@@ -310,8 +349,9 @@ export class Orchestrator {
             s.ledger.setTask(text, m.info.time.created);
           }
         } else {
-          if (m.info.agent) s.agent = m.info.agent;
-          if (m.info.model?.providerID) {
+          // Only fall back to historical messages when live session metadata did not specify agent/model.
+          if (!s.agent && m.info.agent) s.agent = m.info.agent;
+          if (!s.model && m.info.model?.providerID) {
             s.model = m.info.model;
             s.streamer?.setMainModel(s.model);
           }
@@ -327,6 +367,11 @@ export class Orchestrator {
           }
         }
       }
+      s.ledger.setMeta({
+        agent: s.agent,
+        modelKey: s.model?.providerID ? `${s.model.providerID}/${s.model.modelID}` : undefined,
+        directory: s.directory,
+      });
     } catch (e) {
       this.log.warn("hydrate: messages lookup failed", { sessionID: s.id, error: e instanceof Error ? e.message : String(e) });
     }
@@ -394,15 +439,36 @@ export class Orchestrator {
     try {
       const lexicon = await this.lexiconFor(s.directory);
       this.out.toSession(s.id, { type: "lexicon", sessionID: s.id, phrases: topPhrases(lexicon, this.registry.aliases(), this.cfg.lexicon.phraseTerms) });
+      await s.streamer.syncMainModel(s.model);
       await s.streamer.seed(this.contextBlock(s, lexicon));
     } catch (e) {
       this.log.error("streamer start failed", { sessionID: s.id, error: e instanceof Error ? e.message : String(e) });
     }
   }
 
+  private async ensureAgentDescriptions(directory?: string) {
+    if (this.agentsLoaded) return;
+    this.agentsLoaded = true;
+    try {
+      const agents = await this.client.listAgents(directory);
+      for (const a of agents) {
+        if (a.description) {
+          if (a.id) this.agentDescriptions.set(a.id.toLowerCase(), a.description);
+          if (a.name) this.agentDescriptions.set(a.name.toLowerCase(), a.description);
+        }
+      }
+    } catch {
+      this.agentsLoaded = false;
+    }
+  }
+
   private contextBlock(s: Session, lexicon: Lexicon | undefined): string {
+    const activeAgent = s.agent || "Colab";
     const lines = ["[CONTEXT]", `date: ${new Date().toISOString().slice(0, 16).replace("T", " ")}`, `session: ${s.title || s.id}`, `directory: ${s.directory}`];
-    lines.push(`main agent you embody: ${s.agent || "Colab"}`);
+    lines.push(`main agent you embody: ${activeAgent}`);
+    const roleDesc = this.agentDescriptions.get(activeAgent.toLowerCase());
+    if (roleDesc) lines.push(`agent role: ${excerpt(roleDesc, 260)}`);
+    if (s.model?.providerID) lines.push(`active model: ${s.model.providerID}/${s.model.modelID}`);
     lines.push(`session is ${s.status}`);
     if (s.userPrompt) lines.push(`latest prompt from user: ${excerpt(s.userPrompt, 400)}`);
     if (s.lastAnswer) lines.push(`latest answer (summary):\n${s.lastAnswer.slice(0, 1400)}`);
@@ -633,19 +699,55 @@ export class Orchestrator {
   }
 
   private applySessionInfo(s: Session, info: SessionInfo & { model?: { providerID: string; id?: string; modelID?: string } }) {
+    const prevAgent = s.agent;
+    const prevModelKey = s.model?.providerID ? `${s.model.providerID}/${s.model.modelID}` : "";
+    const prevDir = s.directory;
     s.title = info.title || s.title;
     s.parentID = info.parentID ?? s.parentID;
-    s.agent = info.agent ?? s.agent;
+    if (info.agent) s.agent = info.agent;
     if (info.model?.providerID) {
       s.model = { providerID: info.model.providerID, modelID: info.model.modelID ?? info.model.id ?? "" };
-      s.streamer?.setMainModel(s.model);
     }
-    if (!s.directory && info.directory) s.directory = info.directory;
-    if (s.parentID) {
-      const r = this.root(s);
-      if (r !== s) r.ledger.onSubagentInfo(s.id, { agent: s.agent, title: s.title, status: s.status });
+    const r = this.root(s);
+    if (s === r) {
+      const nextModelKey = s.model?.providerID ? `${s.model.providerID}/${s.model.modelID}` : "";
+      s.ledger.setMeta({
+        agent: s.agent,
+        modelKey: nextModelKey || undefined,
+        directory: info.directory || s.directory,
+      });
+      if (nextModelKey && nextModelKey !== prevModelKey) {
+        void s.streamer?.syncMainModel(s.model);
+      }
+      if (s.agent && s.agent !== prevAgent) {
+        this.log.info("main agent changed", { sessionID: s.id, from: prevAgent || "(default)", to: s.agent });
+        if (s.live && s.streamer) {
+          void this.ensureAgentDescriptions(s.directory).then(() => this.reseed(s));
+        }
+      }
+      if (info.directory && info.directory !== prevDir) {
+        void this.moveSessionDirectory(s, info.directory);
+      }
+    } else if (s.parentID) {
+      r.ledger.onSubagentInfo(s.id, { agent: s.agent, title: s.title, status: s.status });
     }
     s.streamer?.setTitle(s.title);
+  }
+
+  private async moveSessionDirectory(s: Session, nextDir: string) {
+    if (!nextDir || nextDir === s.directory) return;
+    const prevDir = s.directory;
+    s.directory = nextDir;
+    s.ledger.setMeta({ directory: nextDir });
+    this.out.updateDirectory?.(s.id, nextDir);
+    this.log.info("session directory moved", { sessionID: s.id, from: prevDir, to: nextDir });
+    await s.streamer?.moveDirectory(nextDir);
+    const lexicon = await this.lexiconFor(nextDir);
+    if (s.live) {
+      this.out.toSession(s.id, { type: "lexicon", sessionID: s.id, phrases: topPhrases(lexicon, this.registry.aliases(), this.cfg.lexicon.phraseTerms) });
+      this.out.toSession(s.id, { type: "navigate", sessionID: s.id, directory: nextDir, url: sessionUrl(nextDir, s.id) });
+      await this.reseed(s);
+    }
   }
 
   private recordFinding(s: Session, tool: string, output: string) {
@@ -1290,19 +1392,32 @@ export class Orchestrator {
     if (s.phase === "interrupted") this.setPhase(s, "speaking");
   }
 
-  async onTranscript(sessionID: string, text: string, opts: { bargeIn: boolean; spokenOver?: string; lang?: string; directory?: string }): Promise<string> {
+  async onTranscript(
+    sessionID: string,
+    text: string,
+    opts: {
+      bargeIn: boolean;
+      spokenOver?: string;
+      lang?: string;
+      directory?: string;
+      agent?: string;
+      model?: { providerID: string; modelID: string };
+    },
+  ): Promise<string> {
     const raw = text.trim();
     if (!raw) return "empty";
     // No session yet: create one now, and move the cockpit onto it, so what
     // follows lands in a conversation the user can actually see.
     if (!sessionID) {
-      const created = await this.materialize(opts.directory);
+      const created = await this.materialize(opts.directory, { agent: opts.agent, model: opts.model });
       if (!created) return "no-session";
       sessionID = created;
     }
     const s = this.sessions.get(sessionID) ?? this.ensureSession(sessionID, opts.directory ?? "");
     if (!s.live) {
-      await this.setLive(sessionID, true, opts.directory, opts.lang);
+      await this.setLive(sessionID, true, opts.directory, opts.lang, { agent: opts.agent, model: opts.model });
+    } else if (opts.agent || opts.model) {
+      await this.syncClientMeta(s, { agent: opts.agent, model: opts.model }, { pushToServer: true });
     }
     if (!s.streamer) {
       await this.startStreamer(s);
@@ -1412,17 +1527,27 @@ export class Orchestrator {
    * composer and pressing enter: OpenCode owns the session, the web UI shows
    * it, and everything after this point is the ordinary path.
    */
-  private async materialize(directory: string | undefined): Promise<string | undefined> {
+  private async materialize(
+    directory: string | undefined,
+    meta?: { agent?: string; model?: { providerID: string; modelID: string } },
+  ): Promise<string | undefined> {
     const dir = directory || [...this.pendingLive][0];
     if (!dir) {
       this.log.error("cannot create a session: no directory known");
       return undefined;
     }
+    const pendingMeta = this.pendingMetaByDir.get(dir);
+    this.pendingMetaByDir.delete(dir);
+    const agent = meta?.agent || pendingMeta?.agent;
+    const model = meta?.model || pendingMeta?.model;
     try {
-      const created = await this.client.createSession(dir, {});
+      const created = await this.client.createSession(dir, {
+        ...(agent && agent !== "build" ? { agent } : {}),
+        ...(model?.providerID && model?.modelID ? { model } : {}),
+      });
       this.pendingLive.delete(dir);
       const s = this.ensureSession(created.id, created.directory || dir);
-      this.applySessionInfo(s, created);
+      this.applySessionInfo(s, { ...created, ...(agent && !created.agent ? { agent } : {}), ...(model && !created.model ? { model } : {}) });
       s.live = true;
       this.log.info("session created for a voice turn", { sessionID: created.id, directory: dir });
       this.out.rebind(
@@ -1609,13 +1734,70 @@ export class Orchestrator {
     }
   }
 
-  setPrefs(sessionID: string, prefs: { digest?: boolean; muted?: boolean; lang?: string }) {
+  setPrefs(
+    sessionID: string,
+    prefs: {
+      digest?: boolean;
+      muted?: boolean;
+      lang?: string;
+      agent?: string;
+      model?: { providerID: string; modelID: string };
+    },
+  ) {
+    if (!sessionID) return;
     const s = this.sessions.get(sessionID);
     if (!s) return;
     if (prefs.digest !== undefined) s.prefs.digest = prefs.digest;
     if (prefs.muted !== undefined) s.prefs.muted = prefs.muted;
     if (prefs.lang !== undefined) this.setLanguage(s, prefs.lang);
     this.registry.setPrefs(sessionID, { digest: prefs.digest, muted: prefs.muted });
+    if (prefs.agent || prefs.model) {
+      void this.syncClientMeta(s, { agent: prefs.agent, model: prefs.model }, { pushToServer: true });
+    }
+  }
+
+  private async syncClientMeta(
+    s: Session,
+    meta: { agent?: string; model?: { providerID: string; modelID: string } },
+    opts: { pushToServer?: boolean } = {},
+  ) {
+    const prevAgent = s.agent;
+    const prevModelKey = s.model?.providerID ? `${s.model.providerID}/${s.model.modelID}` : "";
+    let agentChanged = false;
+    let modelChanged = false;
+
+    if (meta.agent && meta.agent !== "build" && meta.agent !== s.agent) {
+      s.agent = meta.agent;
+      agentChanged = true;
+    }
+    if (meta.model?.providerID && meta.model?.modelID) {
+      const nextKey = `${meta.model.providerID}/${meta.model.modelID}`;
+      if (nextKey !== prevModelKey) {
+        s.model = { providerID: meta.model.providerID, modelID: meta.model.modelID };
+        modelChanged = true;
+      }
+    }
+
+    if (agentChanged || modelChanged) {
+      const modelKey = s.model?.providerID ? `${s.model.providerID}/${s.model.modelID}` : undefined;
+      s.ledger.setMeta({ agent: s.agent, modelKey, directory: s.directory });
+    }
+    if (opts.pushToServer && s.status === "idle") {
+      if (agentChanged && s.agent) {
+        await this.client.setSessionAgent(s.id, s.directory, s.agent).catch(() => undefined);
+      }
+      if (modelChanged && s.model) {
+        await this.client.setSessionModel(s.id, s.directory, s.model).catch(() => undefined);
+      }
+    }
+    if (modelChanged && s.model) {
+      await s.streamer?.syncMainModel(s.model);
+    }
+    if (agentChanged && s.agent !== prevAgent && s.live && s.streamer) {
+      this.log.info("synced agent from cockpit UI", { sessionID: s.id, from: prevAgent || "(default)", to: s.agent });
+      await this.ensureAgentDescriptions(s.directory);
+      await this.reseed(s);
+    }
   }
 
   private async reseed(s: Session) {

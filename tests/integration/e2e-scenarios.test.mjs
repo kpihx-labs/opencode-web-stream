@@ -284,3 +284,37 @@ test("long busy turn triggers periodic [PROGRESS] check-in with live state", asy
   await until(() => h.spoken().some((s) => s.text.includes("Admission")), { label: "progress spoken" });
   h.opencode.emit(DIRECTORY, "session.status", { sessionID: session.id, status: { type: "idle" } });
 });
+
+test("hydrate keeps current session agent instead of reverting to old message history, and mid-session agent/directory changes re-sync streamer", async (t) => {
+  const h = await setup();
+  t.after(() => h.cleanup());
+  const session = h.opencode.addSession({ id: "ses_meta", directory: DIRECTORY, agent: "Explore" });
+  // Historical message used an older agent ("Colab"); hydrate must NOT revert Explore back to Colab!
+  h.opencode.addMessage(session.id, {
+    info: { id: "m_old", sessionID: session.id, role: "assistant", agent: "Colab", model: { providerID: "p", modelID: "old-m" }, time: { created: 1, completed: 2 } },
+    parts: [{ id: "p_old", sessionID: session.id, messageID: "m_old", type: "text", text: "Old answer" }],
+  });
+
+  h.send({ type: "attach", sessionID: session.id, directory: DIRECTORY, protocol: 5, visible: true });
+  h.send({ type: "live", sessionID: session.id, enabled: true, directory: DIRECTORY });
+  await until(() => h.opencode.prompts.some((p) => p.body.noReply), { label: "initial seed" });
+
+  const firstSeed = h.opencode.prompts.find((p) => p.body.noReply)?.body.parts?.[0]?.text ?? "";
+  assert.match(firstSeed, /main agent you embody: Explore/, "must keep current session agent Explore instead of old message Colab");
+
+  // Mid-session agent switch to Pure -> streamer must re-seed with Pure.
+  const prevSeeds = h.opencode.prompts.filter((p) => p.body.noReply).length;
+  h.opencode.emit(DIRECTORY, "session.updated", { info: { ...session, agent: "Pure" } });
+  await until(() => h.opencode.prompts.filter((p) => p.body.noReply).length > prevSeeds, { label: "reseed after agent change" });
+  const latestSeed = h.opencode.prompts.filter((p) => p.body.noReply).at(-1)?.body.parts?.[0]?.text ?? "";
+  assert.match(latestSeed, /main agent you embody: Pure/);
+
+  // Directory move -> navigates cockpit with new directory and re-seeds streamer with new directory.
+  const newDir = "/tmp/other-project";
+  const prevSeeds2 = h.opencode.prompts.filter((p) => p.body.noReply).length;
+  h.opencode.emit(DIRECTORY, "session.updated", { info: { ...session, agent: "Pure", directory: newDir } });
+  await until(() => h.msgs.some((m) => m.type === "navigate" && m.directory === newDir), { label: "navigate on move" });
+  await until(() => h.opencode.prompts.filter((p) => p.body.noReply).length > prevSeeds2, { label: "reseed on move" });
+  const movedSeed = h.opencode.prompts.filter((p) => p.body.noReply).at(-1)?.body.parts?.[0]?.text ?? "";
+  assert.match(movedSeed, /directory: \/tmp\/other-project/);
+});

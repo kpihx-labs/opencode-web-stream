@@ -159,8 +159,21 @@ export class DaemonLink {
     }
   }
 
-  attach(sessionID: string, directory: string | undefined, visible: boolean) {
-    this.send({ type: "attach", sessionID, directory: directory || undefined, protocol: PROTOCOL_VERSION, visible });
+  attach(
+    sessionID: string,
+    directory: string | undefined,
+    visible: boolean,
+    meta?: { agent?: string; model?: { providerID: string; modelID: string } },
+  ) {
+    this.send({
+      type: "attach",
+      sessionID,
+      directory: directory || undefined,
+      protocol: PROTOCOL_VERSION,
+      visible,
+      ...(meta?.agent ? { agent: meta.agent } : {}),
+      ...(meta?.model ? { model: meta.model } : {}),
+    });
   }
 
   close() {
@@ -176,7 +189,16 @@ export class DaemonLink {
 /** POST audio to the daemon's transcription proxy. */
 export async function postAudio(
   blob: Blob,
-  params: { sessionID: string; directory?: string; lang?: string; bargeIn?: boolean; spokenOver?: string; apply?: boolean },
+  params: {
+    sessionID: string;
+    directory?: string;
+    lang?: string;
+    bargeIn?: boolean;
+    spokenOver?: string;
+    apply?: boolean;
+    agent?: string;
+    model?: { providerID: string; modelID: string };
+  },
   signal?: AbortSignal,
 ): Promise<{ text: string; decision?: string }> {
   const query = new URLSearchParams({ session: params.sessionID });
@@ -186,6 +208,8 @@ export async function postAudio(
   if (params.bargeIn) query.set("bargeIn", "1");
   if (params.spokenOver) query.set("spokenOver", params.spokenOver.slice(0, 500));
   if (params.apply === false) query.set("apply", "0");
+  if (params.agent) query.set("agent", params.agent);
+  if (params.model?.providerID && params.model?.modelID) query.set("model", `${params.model.providerID}/${params.model.modelID}`);
   const res = await fetch(DaemonLink.apiUrl(`/api/stt?${query}`), {
     method: "POST",
     headers: { "content-type": blob.type || "audio/webm" },

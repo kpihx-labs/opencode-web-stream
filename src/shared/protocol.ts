@@ -69,6 +69,9 @@ export type SessionSnapshot = {
   lastHeard?: { raw: string; corrected: string };
   /** Two-letter code of the language the user last spoke in. */
   lang: string;
+  /** Active main session agent & model (synced live with streamer). */
+  agent?: string;
+  model?: { providerID: string; modelID: string };
   /** Whether answers are reformulated via streamer digest rather than read raw. */
   digest?: boolean;
 };
@@ -124,10 +127,10 @@ export type ControlAction =
 
 export type ClientMessage =
   /** Cockpit announces itself and the session it is looking at. */
-  | { type: "attach"; sessionID: string; directory?: string; protocol: number; visible: boolean }
+  | { type: "attach"; sessionID: string; directory?: string; protocol: number; visible: boolean; agent?: string; model?: { providerID: string; modelID: string } }
   | { type: "detach"; sessionID: string }
   /** Live mode toggled from the cockpit button. `sessionID` is empty on the new-session page. */
-  | { type: "live"; sessionID: string; enabled: boolean; directory?: string; lang?: string }
+  | { type: "live"; sessionID: string; enabled: boolean; directory?: string; lang?: string; agent?: string; model?: { providerID: string; modelID: string } }
   /** A final transcript. `spokenOver` is what the user heard before cutting in. */
   | {
       type: "transcript";
@@ -138,6 +141,8 @@ export type ClientMessage =
       lang?: string;
       /** Set when `sessionID` is empty: where to create the session. */
       directory?: string;
+      agent?: string;
+      model?: { providerID: string; modelID: string };
     }
   /** The user started speaking while we were talking: stop audio now. */
   | { type: "barge_in"; sessionID: string; spokenOver?: string }
@@ -145,8 +150,8 @@ export type ClientMessage =
   | { type: "barge_in_false"; sessionID: string }
   /** The cockpit finished (or gave up on) an utterance. */
   | { type: "spoken"; sessionID: string; utteranceId: string; completed: boolean; heardText?: string }
-  /** Cockpit-local preference changes worth persisting server-side. */
-  | { type: "prefs"; sessionID: string; digest?: boolean; muted?: boolean; lang?: string }
+  /** Cockpit-local preference and meta changes worth syncing server-side. */
+  | { type: "prefs"; sessionID: string; digest?: boolean; muted?: boolean; lang?: string; agent?: string; model?: { providerID: string; modelID: string } }
   /** Direct control from a cockpit button rather than from voice. */
   | { type: "control"; sessionID: string; action: ControlAction }
   | { type: "visible"; sessionID: string; visible: boolean }

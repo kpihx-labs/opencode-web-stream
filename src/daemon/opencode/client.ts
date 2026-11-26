@@ -18,6 +18,7 @@ import type { ScopedLogger } from "../log.js";
 
 export type WithParts = { info: MessageInfo; parts: Part[] };
 export type Project = { id: string; worktree: string; name?: string };
+export type AgentInfo = { id: string; name: string; description?: string };
 export type FetchLike = typeof fetch;
 export type ApiMode = "auto" | "v1" | "v2";
 
@@ -169,6 +170,24 @@ export class OpencodeClient {
     });
   }
 
+  async moveSession(sessionID: string, directory: string, targetDirectory: string): Promise<void> {
+    if ((await this.resolveMode()) !== "v2") return;
+    await this.request<unknown>("POST", `/api/session/${encodeURIComponent(sessionID)}/move`, {
+      directory,
+      body: { directory: targetDirectory },
+    });
+  }
+
+  async listAgents(directory?: string): Promise<AgentInfo[]> {
+    if ((await this.resolveMode()) !== "v2") return [];
+    const raw = await this.request<{ data?: Array<Record<string, unknown>> }>("GET", "/api/agent", { directory });
+    return (raw?.data ?? []).map((a) => ({
+      id: String(a.id ?? a.name ?? ""),
+      name: String(a.name ?? a.id ?? ""),
+      description: typeof a.description === "string" ? a.description : undefined,
+    }));
+  }
+
   async listSessions(directory: string): Promise<SessionInfo[]> {
     if ((await this.resolveMode()) === "v2") {
       const raw = await this.request<{ data?: Array<Record<string, unknown>> }>("GET", "/api/session", { directory });
@@ -247,7 +266,11 @@ export class OpencodeClient {
         `/api/session/${encodeURIComponent(sessionID)}/prompt`,
         {
           directory,
-          body: { text },
+          body: {
+            text,
+            ...(body.agent ? { agent: body.agent } : {}),
+            ...(body.model ? { model: { providerID: body.model.providerID, id: body.model.modelID } } : {}),
+          },
           timeoutMs: opts.timeoutMs === 0 ? 0 : (opts.timeoutMs ?? 120000),
           signal: opts.signal,
         },

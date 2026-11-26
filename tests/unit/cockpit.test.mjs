@@ -164,3 +164,38 @@ test("pause/resume guards against deadlocks and duplicate je dis rows", () => {
   assert.match(bundle, /pendingHeards/);
   assert.match(bundle, /onUtteranceDiscarded/);
 });
+
+test("resolveUiMeta reads OpenCode Web V2 workspace:model-selection for active session and new-session draft", () => {
+  const resolveUiMeta = extract("resolveUiMeta");
+  const key = "opencode.workspace.-var-tmp.19albml.dat:workspace:model-selection";
+  const val = JSON.stringify({
+    session: {
+      ses_x1: {
+        agent: "Explore",
+        choice: { providerID: "nvidia", modelID: "m-default" },
+        choices: { Explore: { providerID: "opencode-go", modelID: "hy4-flash-free" } },
+      },
+      new: {
+        agent: "Pure",
+        choice: { providerID: "opencode-go", modelID: "fast-pure" },
+      },
+    },
+  });
+  globalThis.localStorage = {
+    length: 1,
+    key: (i) => (i === 0 ? key : null),
+    getItem: (k) => (k === key ? val : null),
+  };
+  try {
+    assert.deepEqual(resolveUiMeta("ses_x1", "/var/tmp"), {
+      agent: "Explore",
+      model: { providerID: "opencode-go", modelID: "hy4-flash-free" },
+    });
+    assert.deepEqual(resolveUiMeta("", "/var/tmp"), {
+      agent: "Pure",
+      model: { providerID: "opencode-go", modelID: "fast-pure" },
+    });
+  } finally {
+    delete globalThis.localStorage;
+  }
+});
