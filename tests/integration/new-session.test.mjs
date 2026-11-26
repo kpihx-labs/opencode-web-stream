@@ -20,7 +20,7 @@ import { sessionUrl } from "../../dist/daemon/core/orchestrator.js";
  * onto it, which is what typing and pressing enter does.
  */
 
-const DIRECTORY = "/home/kpihx/project";
+const DIRECTORY = "/home/user/project";
 
 async function harness() {
   const opencode = new FakeOpencode();
@@ -100,9 +100,9 @@ test("speaking on the new-session page creates the session and moves the cockpit
 });
 
 test("the url the cockpit is sent to is the one opencode web uses", () => {
-  const url = sessionUrl("/home/kpihx/project", "ses_abc");
+  const url = sessionUrl("/home/user/project", "ses_abc");
   const [, dir, , id] = url.split("/");
-  assert.equal(Buffer.from(dir, "base64").toString("utf8"), "/home/kpihx/project");
+  assert.equal(Buffer.from(dir, "base64").toString("utf8"), "/home/user/project");
   assert.equal(id, "ses_abc");
 });
 

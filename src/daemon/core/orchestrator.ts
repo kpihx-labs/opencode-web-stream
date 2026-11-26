@@ -364,10 +364,10 @@ export class Orchestrator {
     const lines = ["[CONTEXT]", `date: ${new Date().toISOString().slice(0, 16).replace("T", " ")}`, `session: ${s.title || s.id}`, `directory: ${s.directory}`];
     if (s.agent) lines.push(`main agent: ${s.agent}`);
     lines.push(`session is ${s.status}`);
-    if (s.userPrompt) lines.push(`latest prompt from KπX: ${excerpt(s.userPrompt, 600)}`);
+    if (s.userPrompt) lines.push(`latest prompt from user: ${excerpt(s.userPrompt, 600)}`);
     if (s.lastAnswer) lines.push(`latest answer (excerpt): ${excerpt(s.lastAnswer, 600)}`);
     lines.push(`answer reading mode: ${s.prefs.digest ? "digest" : "full"}`);
-    lines.push(`languages: ${this.cfg.speech.languages.join(", ")} (default ${this.cfg.speech.default}); KπX last spoke ${s.lang}`);
+    lines.push(`languages: ${this.cfg.speech.languages.join(", ")} (default ${this.cfg.speech.default}); user last spoke ${s.lang}`);
     lines.push(renderLexiconContext(lexicon, this.registry.aliases(), this.cfg.lexicon.contextTerms));
     return lines.join("\n");
   }
@@ -996,7 +996,7 @@ export class Orchestrator {
     if (!s) return;
     if (completed && s.phase === "speaking") this.setPhase(s, s.status === "busy" ? "thinking" : s.pending ? "waiting_user" : "listening");
     if (heardText !== undefined && s.streamer && !completed) {
-      void s.streamer.seed(`[HEARD]\nKπX heard only this before cutting in: ${excerpt(heardText, 300)}`).catch(() => undefined);
+      void s.streamer.seed(`[HEARD]\nThe user heard only this before cutting in: ${excerpt(heardText, 300)}`).catch(() => undefined);
     }
   }
 
@@ -1046,7 +1046,7 @@ export class Orchestrator {
     const lines = ["[VOICE]", `transcript: ${raw}`];
     lines.push(`language: ${s.lang}${opts.lang ? ` (recognizer said ${opts.lang})` : ""}`);
     lines.push(`session is ${s.status}${s.answer ? " and answering" : ""}`);
-    if (opts.bargeIn) lines.push(`KπX cut you off while you were saying: ${excerpt(opts.spokenOver ?? s.lastSpoken ?? "", 300)}`);
+    if (opts.bargeIn) lines.push(`The user cut you off while you were saying: ${excerpt(opts.spokenOver ?? s.lastSpoken ?? "", 300)}`);
     else if (s.lastSpoken) lines.push(`last thing you said: ${excerpt(s.lastSpoken, 200)}`);
     if (s.pending?.kind === "permission") {
       lines.push(`pending permission: ${s.pending.req.permission} on ${s.pending.req.patterns.join(", ")} (answers: once | always | reject)`);
