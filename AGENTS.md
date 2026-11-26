@@ -22,8 +22,11 @@ Concretely, the following are forbidden in this codebase:
 
 - Lists of tools classified as interesting or boring.
 - Word lists: stop-words, filler words, noise phrases, command keywords.
-- Confidence thresholds that silently discard what the user said.
-- Pattern matching on transcripts to detect intent.
+- Hardcoded spoken phrases, refusal templates (`phrases.json`), or instructional prompt prose inside `.ts` files. All prompts and classification criteria live externally in `agent/streamer.md` and `agent/decision.prompt.json`.
+- Arbitrary time/length cutoffs (`beatTimeoutMs`, `voiceTimeoutMs`, `tts.timeoutMs`, `stt.timeoutMs`, `maxUtteranceMs` default to `0` = unbounded unless explicitly preempted or cancelled).
+- Confidence thresholds or substring/word-count heuristics that silently discard what the user said.
+- Pattern matching on transcripts to detect intent or echo.
+- Language-locked assumptions: every user-facing utterance is generated dynamically by the model in whatever language the user just spoke.
 - Anything that answers "what did they mean" without asking the model.
 
 What the code *is* allowed to decide:
@@ -49,27 +52,30 @@ heuristics creep back in.
 ```
 browser (Lens plugin)          daemon (this repo)              opencode serve
 ┌──────────────────────┐      ┌──────────────────────┐       ┌──────────────────┐
-│ mic + VAD + barge-in │      │ SSE watcher          │◀──────│ /global/event    │
-│ STT (server/browser) │◀────▶│ session state machine│       │                  │
-│ TTS queue + playback │  ws  │ beat windows         │──────▶│ /session/:id/... │
-│ transcript strip     │      │ streamer sessions    │       │   prompt, abort, │
-│ live button          │      │ workspace lexicon    │       │   permissions    │
-└──────────────────────┘      └──────────────────────┘       └──────────────────┘
+│ mic + VAD + WAV 16k  │      │ SSE watcher          │◀──────│ /api/event       │
+│ live interim + AEC   │◀────▶│ session state machine│       │                  │
+│ TTS queue + pause/   │  ws  │ beat windows         │──────▶│ /api/session/... │
+│   exact ms resume    │      │ streamer sessions    │       │   prompt, abort, │
+│ scrollable feed strip│      │ workspace + Hex lex. │       │   permissions    │
+└──────────────────────┘      └──────────┬───────────┘       └──────────────────┘
                                          │
-                                         ▼
-                              OpenAI-compatible STT / TTS
-                              (local: speaches, Kokoro, …)
+                      ┌──────────────────┼──────────────────┐
+                      ▼                  ▼                  ▼
+           Ollaya (largha ~45ms)   Hex Orukeet STT     Built-in edge-tts WS
+            /v1/systemone          (or browser/URL)    (no deflate + warm WS)
 ```
 
 - **`src/daemon`** — the brain. Subscribes to the OpenCode event bus, keeps one
-  state machine per live session, asks the streamer for decisions, acts on the
-  session through the REST API, serves the cockpit.
-- **`src/browser`** — the cockpit. Audio in, audio out, and the smallest
-  possible UI. Ships as `dist/plugin.js`, loaded by opencode-lens.
-- **`src/shared`** — the wire protocol and the OpenCode event shapes, imported
-  by both sides so a change breaks the build rather than production.
-- **`agent/streamer.md`** — the streamer's prompt. Copy it to
-  `~/.config/opencode/agents/streamer.md`.
+  state machine per live session, routes triage via Ollaya `largha` and
+  judgement via `streamer`, acts on the session through the REST API, serves the cockpit.
+- **`src/browser`** — the cockpit. Audio in (16 kHz WAV + live Web Speech interim preview),
+  audio out (`AudioBuffer` with exact-offset pause/resume + WebRTC loopback AEC),
+  scrollable `.ows-feed` strip with `stt:hex ↔ stt:web` toggle. Ships as `dist/plugin.js`, loaded by opencode-lens.
+- **`src/shared`** — the wire protocol (`protocol.ts`) and OpenCode event shapes, imported
+  by both sides so a change breaks the build rather than production. Zero hardcoded phrase files.
+- **`agent/streamer.md`** & **`agent/decision.prompt.json`** — external model prompts and System-One criteria.
+  All behavioural changes belong here, never inside `.ts` code.
+  In addition to installing `agent/streamer.md` for OpenCode, the daemon seeds the contract directly into new streamer sessions so host-side agent caching never causes prompt drift.
 
 There is deliberately **no OpenCode plugin**. Everything a server-side plugin
 could observe is on the event stream, and a daemon survives OpenCode restarts,
@@ -159,13 +165,13 @@ Defaults live in `src/daemon/config.ts` and every one of them is configurable.
 | --- | --- | --- |
 | Beat window | 2.5 s or 6 tools | Short enough to stay present tense. |
 | Beat time to live | 9 s | A narration that arrives after the moment is noise. |
-| Streamer budget, beat | 9 s | Past that, the next beat carries better information. |
-| Streamer budget, voice | 20 s | The user is waiting; failure falls back to queueing the raw text. |
+| Streamer / STT / TTS / Decision timeouts | `0` (unbounded) | Never abort reasoning, dictation, or synthesis on an arbitrary timer; only preemption or cancellation stops them. |
 | Injection delay | 1.5 s | The window in which the cockpit can cancel it. |
 | Blocked repeat | 45 s, twice | Being stuck without knowing it is the worst failure mode. |
-| Speech confirmed | 320 ms | Below that it is a click, not a word. |
-| Silence hangover | 850 ms | End of utterance without cutting people off mid-thought. |
-| False barge-in | 2.2 s | No words after an interruption: resume where the audio stopped. |
+| Speech confirmed | 220 ms (450 ms ducked) | Below that it is a click, not a word; higher bar while speaking prevents speaker pops from interrupting. |
+| Silence hangover | 550 ms | End of utterance without cutting people off mid-thought. |
+| Max utterance | `0` (unbounded) | Never cut off long natural speech by clock. |
+| False barge-in | 2.2 s | No words after an interruption: resume from exact millisecond (`pausedItem.resumeOffsetSec`). |
 
 Speech priority: `blocked` (40) > `system` (35) > `reply` (30) > `answer` (20) >
 `beat` (10). A strictly higher priority preempts playback. Chunks of one answer
@@ -241,22 +247,24 @@ Each of these is covered by a test; treat the list as a specification.
 | Live enabled before any prompt | Streamer created, context seeded with `noReply`, no model call yet. |
 | Live enabled on the new-session page | Armed against the directory in the URL; no session lookup, no model call. |
 | Speaking with no session yet | The session is created, the cockpit is moved onto it, then the ordinary path runs. |
-| No directory in the URL | The daemon says so out loud instead of calling the API with an empty id. |
+| No directory in the URL | Button shows `noDir` state; daemon rejects `live` cleanly with `no_directory` error code. |
 | Browser reload | Daemon keeps the state; the cockpit resyncs without replaying speech. |
 | OpenCode restart | Binding survives; a 404 on the streamer session recreates it. |
 | Daemon restart | Registry reloaded, SSE resubscribed. |
 | Two tabs or two devices | One speaker elected (visible, most recent); others display only. |
-| Several live sessions | Voice on the focused one; the others only surface blocking events, prefixed by session name. |
+| Several live sessions | Voice on the focused one; the others surface blocking events with `sessionLabel`. |
 | `task` subagents | Folded into the parent; beats tagged with the subagent. |
 | Permission or question pending | Preempts narration, repeated twice, answerable by voice. |
 | Provider retry | Announced once per episode. |
-| Compaction | One short notice, context reseeded. |
+| Compaction / system failure | Emits `[SYSTEM]` event so `streamer` phrases the notice dynamically in the user's language; context reseeded. |
 | Streamer session grows | Summarized automatically past the prompt budget. |
 | Huge tool output | Truncated before it reaches the model. |
 | Forty reads in a row | Windowed; a stale beat is dropped rather than spoken late. |
-| Answer full of code | Prose spoken live, code blocks replaced by one notice, digest requested past the code ratio. |
-| User speaks over the voice | Audio stops locally in one frame; what was heard travels to the streamer. |
-| Microphone hears the voice | Loopback echo cancellation, ducked threshold, and the streamer sees its own text as context. |
+| Answer full of code | Prose spoken live via `SentenceSplitter`, digest requested past the code ratio without cutting an active stream mid-sentence. |
+| User speaks over the voice | Audio pauses immediately (`pausedItem` + `resumeOffsetSec`); false barge-in resumes from the exact millisecond. |
+| Microphone hears the voice | Single-path WebRTC loopback echo cancellation (`setLoopbackActive`), ducked threshold (+900 ms tail), and `streamer` sees `last_spoken` in `[VOICE]` to ignore echoes in any language. |
+| Hex `no-speech` on ambient sound | Treated cleanly as empty transcript (`{ text: "" }`), never disables Hex STT. |
+| User asks for action / lookup | **Action + Speech in parallel:** whenever facts are not already in context, `streamer` MUST emit `<inject>` + `<say>` together, NEVER promise to check inside `<reply>` alone. |
 | Cough, "hmm", noise | Discarded by duration, then by the streamer. |
 | Unknown term | Streamer picks the likeliest and says so; `<learn>` makes it permanent. |
 | Injection while busy | Queued and picked up next step; `interrupt` aborts first. |
@@ -325,10 +333,11 @@ microphone or a network.
 
 When you add behaviour:
 
-- If it involves a judgement, it belongs in `agent/streamer.md`, not in code.
-- If it involves timing, it belongs in `config.ts` with a default and a test.
+- If it involves judgement or wording, it belongs in `agent/streamer.md` or `agent/decision.prompt.json` — **never** in code.
+- Never add arbitrary timeouts, stopword lists, or text heuristics.
 - If it changes the wire, bump `PROTOCOL_VERSION`.
 - If it is an edge case, add a row to section 7 and a test alongside it.
+- **Always run real end-to-end verification before claiming done:** `npm run typecheck && npm test` (unit + integration), restart `opencode-web-stream` and `opencode-web-lens`, verify live HTTP/WS endpoints (`/api/status`, `/api/tts`, `/api/stt` with both speech & silent WAV), test real action injection (`<inject>` + `<say>`) against OpenCode, and inspect the live browser cockpit UI.
 
 ---
 
