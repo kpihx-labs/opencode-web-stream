@@ -26,6 +26,8 @@ type Job = {
 export type StreamerOptions = {
   agent: string;
   model: string;
+  /** Ordered list of "provider/model" candidates to try in order; empty = follow main session model. */
+  models?: string[];
   mainModel?: ModelRef;
   summarizeEveryPrompts: number;
   titlePrefix?: string;
@@ -35,7 +37,7 @@ export class StreamerSession {
   private queue: Job[] = [];
   private inflight?: { job: Job; controller: AbortController };
   private ensuring?: Promise<string>;
-  private readonly configuredModelRef: ModelRef | undefined;
+  private readonly configuredModels: ModelRef[] = [];
   private mainModelRef: ModelRef | undefined;
   private appliedModelKey = "";
   private disposed = false;
@@ -50,12 +52,20 @@ export class StreamerSession {
     private readonly log: ScopedLogger,
     private readonly hooks: { onStreamerID: (id: string) => void },
   ) {
-    this.configuredModelRef = parseModel(opts.model);
+    const rawList = (opts.models?.length ? opts.models : opts.model ? [opts.model] : [])
+      .map((m) => parseModel(m))
+      .filter((m): m is ModelRef => Boolean(m));
+    this.configuredModels = rawList;
     this.mainModelRef = opts.mainModel;
   }
 
+  private get candidateModels(): Array<ModelRef | undefined> {
+    if (this.configuredModels.length > 0) return this.configuredModels;
+    return [this.mainModelRef];
+  }
+
   private get effectiveModel(): ModelRef | undefined {
-    return this.configuredModelRef ?? this.mainModelRef;
+    return this.configuredModels[0] ?? this.mainModelRef;
   }
 
   setTitle(title: string) {
@@ -174,19 +184,75 @@ export class StreamerSession {
       streamerID = await this.ensure();
       job.onStart?.();
       const timer = setTimeout(() => controller.abort(new Error("timeout")), job.timeoutMs);
+      const candidates = this.candidateModels;
+      let res: Awaited<ReturnType<OpencodeClient["prompt"]>> | undefined;
+      let lastErr: unknown;
+      let usedModel: ModelRef | undefined;
       try {
-        const res = await this.client.prompt(
-          streamerID,
-          this.directory,
-          { agent: this.opts.agent, model: this.effectiveModel, parts: [{ type: "text", text: job.prompt }] },
-          { signal: controller.signal, timeoutMs: job.timeoutMs + 2000 },
-        );
+        for (let i = 0; i < candidates.length; i++) {
+          if (controller.signal.aborted) break;
+          const model = candidates[i];
+          const modelKey = model ? `${model.providerID}/${model.modelID}` : "(session-default)";
+          const t0 = Date.now();
+          if (model && this.appliedModelKey !== `${model.providerID}/${model.modelID}`) {
+            await this.client.setSessionModel(streamerID, this.directory, model).catch(() => undefined);
+            this.appliedModelKey = `${model.providerID}/${model.modelID}`;
+          }
+          try {
+            this.log.debug("streamer prompt start", {
+              kind: job.kind,
+              streamer: streamerID,
+              model: modelKey,
+              attempt: i + 1,
+              total: candidates.length,
+            });
+            const attemptRes = await this.client.prompt(
+              streamerID,
+              this.directory,
+              { agent: this.opts.agent, model, parts: [{ type: "text", text: job.prompt }] },
+              { signal: controller.signal, timeoutMs: job.timeoutMs + 2000 },
+            );
+            const attemptText = textOf(attemptRes?.parts);
+            if (!attemptText && i + 1 < candidates.length) {
+              this.log.warn("streamer candidate returned empty text, trying next", { kind: job.kind, model: modelKey, elapsedMs: Date.now() - t0 });
+              continue;
+            }
+            res = attemptRes;
+            usedModel = model;
+            this.log.debug("streamer prompt ok", {
+              kind: job.kind,
+              streamer: streamerID,
+              model: modelKey,
+              elapsedMs: Date.now() - t0,
+              chars: attemptText.length,
+            });
+            break;
+          } catch (err) {
+            lastErr = err;
+            if (controller.signal.aborted) throw err;
+            this.log.warn("streamer candidate failed", {
+              kind: job.kind,
+              model: modelKey,
+              attempt: i + 1,
+              total: candidates.length,
+              elapsedMs: Date.now() - t0,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            if (err instanceof OpencodeHttpError && (err.status === 404 || err.status === 400)) {
+              this.registry.unbind(this.mainSessionID);
+              streamerID = await this.ensure();
+            }
+          }
+        }
         clearTimeout(timer);
+        if (!res) {
+          throw lastErr ?? new Error("all streamer model candidates failed");
+        }
         const binding = this.registry.binding(this.mainSessionID);
         const prompts = (binding?.prompts ?? 0) + 1;
         this.registry.touch(this.mainSessionID, { prompts });
         job.resolve({ text: textOf(res?.parts), aborted: false, timedOut: false, streamerID });
-        if (prompts % this.opts.summarizeEveryPrompts === 0) void this.compact(streamerID);
+        if (prompts % this.opts.summarizeEveryPrompts === 0) void this.compact(streamerID, usedModel);
       } catch (e) {
         clearTimeout(timer);
         const reason = controller.signal.aborted ? String((controller.signal.reason as Error)?.message ?? "aborted") : "";
@@ -210,8 +276,8 @@ export class StreamerSession {
     }
   }
 
-  private async compact(streamerID: string) {
-    const model = this.effectiveModel;
+  private async compact(streamerID: string, preferredModel?: ModelRef) {
+    const model = preferredModel ?? this.effectiveModel;
     if (!model) return;
     try {
       await this.client.summarize(streamerID, this.directory, model);

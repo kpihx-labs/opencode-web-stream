@@ -128,25 +128,41 @@ export class DecisionEngine {
           "Is the user asking to present, summarize, zoom in on, explain, or discuss results/topics that were already found or displayed on screen (e.g. 'present only the LLM part', 'what did you find about X', 'explain that'), rather than asking to write code or launch a brand new external search?",
       };
     }
+    const t0 = Date.now();
     const res = await this.askSystemOne(
       `speaking=${ctx.speaking} busy=${ctx.busy} has_results_on_screen=${Boolean(ctx.hasScreenAnswer)} text=${JSON.stringify(transcript)}`,
       questions,
     );
     const ans = res?.answers?.intent as ChoiceAnswer | undefined;
-    if (!ans || ans.type !== "choice") return "pass";
-    const probs = ans.probabilities ?? {};
-    if (ans.choice === "stop" && (probs.stop ?? 0) >= 0.4) return "stop";
-    if (ans.choice === "noise" && (probs.noise ?? 0) >= 0.42) return "noise";
-    const fromCtx = res?.answers?.from_context as NoulAnswer | undefined;
-    if (ctx.hasScreenAnswer && fromCtx?.type === "noul" && typeof fromCtx.noul === "number" && fromCtx.noul >= 0.5) {
-      return "answer_from_context";
+    if (!ans || ans.type !== "choice") {
+      this.log.debug("largha voice triage fallback", { elapsedMs: Date.now() - t0, text: transcript.slice(0, 80) });
+      return "pass";
     }
-    return "pass";
+    const probs = ans.probabilities ?? {};
+    let decision: VoiceTriage = "pass";
+    if (ans.choice === "stop" && (probs.stop ?? 0) >= 0.4) decision = "stop";
+    else if (ans.choice === "noise" && (probs.noise ?? 0) >= 0.42) decision = "noise";
+    else {
+      const fromCtx = res?.answers?.from_context as NoulAnswer | undefined;
+      if (ctx.hasScreenAnswer && fromCtx?.type === "noul" && typeof fromCtx.noul === "number" && fromCtx.noul >= 0.5) {
+        decision = "answer_from_context";
+      }
+    }
+    this.log.debug("largha voice triage", {
+      decision,
+      choice: ans.choice,
+      probs,
+      fromContext: (res?.answers?.from_context as NoulAnswer | undefined)?.noul,
+      elapsedMs: Date.now() - t0,
+      text: transcript.slice(0, 80),
+    });
+    return decision;
   }
 
   /** ~45 ms calibrated salience gate for short tool-activity beats. */
   async triageBeat(summary: string): Promise<boolean> {
     if (!(await this.check())) return true;
+    const t0 = Date.now();
     const res = await this.askSystemOne(summary.slice(0, 600), {
       worth_speaking: {
         type: "noul",
@@ -155,7 +171,9 @@ export class DecisionEngine {
     });
     const ans = res?.answers?.worth_speaking as NoulAnswer | undefined;
     if (!ans || ans.type !== "noul" || typeof ans.noul !== "number") return true;
-    return ans.noul >= 0.4;
+    const speak = ans.noul >= 0.4;
+    this.log.debug("largha beat triage", { speak, noul: ans.noul, elapsedMs: Date.now() - t0 });
+    return speak;
   }
 
   private async askSystemOne(

@@ -4,9 +4,9 @@ import { join } from "node:path";
 
 /**
  * Daemon configuration. Precedence: environment > config file > defaults.
- * The file lives at ~/.config/opencode-web-stream/config.json (override with
- * OPENCODE_WEB_STREAM_CONFIG). Every value has a working default so the daemon
- * starts on a bare machine; only the OpenCode URL usually needs adjusting.
+ * The file lives at ~/.config/opencode-web-stream/config.jsonc (or config.json,
+ * override with OPENCODE_WEB_STREAM_CONFIG). Supports JSONC comments and trailing
+ * commas. Every value has a working default so the daemon starts on a bare machine.
  */
 
 export type Config = {
@@ -31,6 +31,8 @@ export type Config = {
   streamer: {
     agent: string;
     model: string;
+    /** Ordered list of "provider/model" candidates to try in order; empty = follow main session model. */
+    models: string[];
     /** Abandon a beat the streamer has not answered within this budget. */
     beatTimeoutMs: number;
     /** A voice turn must be answered within this budget. */
@@ -73,7 +75,11 @@ export type Config = {
     default: string;
   };
   stt: {
-    /** OpenAI-compatible transcription endpoint; empty disables server STT. */
+    /** "hex" (default local Orukeet), "browser" (online Web Speech), "url", or "auto". */
+    mode: "auto" | "hex" | "browser" | "url";
+    /** Hex binary path/name (default "hex"). */
+    binary: string;
+    /** OpenAI-compatible transcription endpoint; empty disables HTTP STT. */
     url: string;
     model: string;
     /** Two-letter code forced on the recognizer, or "auto" to let it detect. */
@@ -109,7 +115,7 @@ export const DEFAULTS: Config = {
   host: "127.0.0.1",
   port: 8765,
   dataDir: join(homedir(), ".local", "share", "opencode-web-stream"),
-  logLevel: "info",
+  logLevel: "debug",
   opencode: {
     url: "http://127.0.0.1:49374",
     username: "opencode",
@@ -125,6 +131,7 @@ export const DEFAULTS: Config = {
   streamer: {
     agent: "streamer",
     model: "",
+    models: [],
     beatTimeoutMs: 9000,
     voiceTimeoutMs: 20000,
     summarizeEveryPrompts: 80,
@@ -151,8 +158,10 @@ export const DEFAULTS: Config = {
     default: "fr",
   },
   stt: {
+    mode: "auto",
+    binary: "hex",
     url: "",
-    model: "",
+    model: "orukeet",
     language: "auto",
     promptTerms: 60,
     timeoutMs: 20000,
@@ -161,10 +170,10 @@ export const DEFAULTS: Config = {
     mode: "auto",
     url: "",
     model: "kokoro",
-    voice: "fr-FR-VivienneMultilingualNeural",
-    voices: { fr: "fr-FR-VivienneMultilingualNeural", en: "en-US-EmmaMultilingualNeural" },
+    voice: "fr-FR-DeniseNeural",
+    voices: { fr: "fr-FR-DeniseNeural", en: "en-US-JennyNeural" },
     format: "mp3",
-    speed: 1.05,
+    speed: 1.08,
     timeoutMs: 20000,
   },
   lexicon: {
@@ -180,14 +189,58 @@ export const DEFAULTS: Config = {
 type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] };
 
 export function configPath(env: NodeJS.ProcessEnv = process.env): string {
-  return env.OPENCODE_WEB_STREAM_CONFIG ?? join(homedir(), ".config", "opencode-web-stream", "config.json");
+  if (env.OPENCODE_WEB_STREAM_CONFIG) return env.OPENCODE_WEB_STREAM_CONFIG;
+  const base = join(homedir(), ".config", "opencode-web-stream");
+  const jsonc = join(base, "config.jsonc");
+  if (existsSync(jsonc)) return jsonc;
+  return join(base, "config.json");
+}
+
+/** Strip JSONC comments (//, /* *\/) and trailing commas while preserving strings. */
+export function stripJsonc(src: string): string {
+  let out = "";
+  let inString = false;
+  let inBlock = false;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    const n = src[i + 1];
+    if (inBlock) {
+      if (c === "*" && n === "/") {
+        inBlock = false;
+        i++;
+      }
+      continue;
+    }
+    if (inString) {
+      out += c;
+      if (c === "\\") out += src[++i] ?? "";
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      out += c;
+      continue;
+    }
+    if (c === "/" && n === "/") {
+      while (i < src.length && src[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && n === "*") {
+      inBlock = true;
+      i++;
+      continue;
+    }
+    out += c;
+  }
+  return out.replace(/,\s*([}\]])/g, "$1");
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, file?: string): Config {
   const path = file ?? configPath(env);
   let fromFile: DeepPartial<Config> = {};
   if (existsSync(path)) {
-    fromFile = JSON.parse(readFileSync(path, "utf8")) as DeepPartial<Config>;
+    fromFile = JSON.parse(stripJsonc(readFileSync(path, "utf8"))) as DeepPartial<Config>;
   }
   const merged = mergeConfig(DEFAULTS, fromFile);
   applyEnv(merged, env);
@@ -218,8 +271,19 @@ function applyEnv(cfg: Config, env: NodeJS.ProcessEnv) {
   if (env.OPENCODE_SERVER_PASSWORD) cfg.opencode.password = env.OPENCODE_SERVER_PASSWORD;
   if (env.OPENCODE_SERVER_USERNAME) cfg.opencode.username = env.OPENCODE_SERVER_USERNAME;
   if (env.OPENCODE_WEB_STREAM_MODEL) cfg.streamer.model = env.OPENCODE_WEB_STREAM_MODEL;
+  if (env.OPENCODE_WEB_STREAM_MODELS) {
+    cfg.streamer.models = env.OPENCODE_WEB_STREAM_MODELS.split(",").map((m) => m.trim()).filter(Boolean);
+  }
+  if (!Array.isArray(cfg.streamer.models)) cfg.streamer.models = [];
+  cfg.streamer.models = cfg.streamer.models.map((m) => String(m).trim()).filter(Boolean);
+  if (cfg.streamer.models.length === 0 && cfg.streamer.model.trim()) {
+    cfg.streamer.models = [cfg.streamer.model.trim()];
+  }
   if (env.OPENCODE_WEB_STREAM_AGENT) cfg.streamer.agent = env.OPENCODE_WEB_STREAM_AGENT;
   if (env.OPENCODE_WEB_STREAM_STT_URL !== undefined) cfg.stt.url = env.OPENCODE_WEB_STREAM_STT_URL;
+  if (env.OPENCODE_WEB_STREAM_STT_MODE) cfg.stt.mode = env.OPENCODE_WEB_STREAM_STT_MODE as Config["stt"]["mode"];
+  if (env.OPENCODE_WEB_STREAM_STT_BIN) cfg.stt.binary = env.OPENCODE_WEB_STREAM_STT_BIN;
+  if (env.OPENCODE_WEB_STREAM_STT_MODEL) cfg.stt.model = env.OPENCODE_WEB_STREAM_STT_MODEL;
   if (env.OPENCODE_WEB_STREAM_TTS_URL !== undefined) cfg.tts.url = env.OPENCODE_WEB_STREAM_TTS_URL;
   if (env.OPENCODE_WEB_STREAM_TTS_VOICE) cfg.tts.voice = env.OPENCODE_WEB_STREAM_TTS_VOICE;
   if (env.OPENCODE_WEB_STREAM_STT_LANG) cfg.stt.language = env.OPENCODE_WEB_STREAM_STT_LANG;

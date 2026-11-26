@@ -39,6 +39,8 @@ export type MicOptions = {
   referenceStream?: MediaStream;
   /** Sustained energy above the floor before speech is confirmed. */
   confirmMs?: number;
+  /** Sustained energy required during agent playback to trigger barge-in. */
+  duckedConfirmMs?: number;
   /** Silence before an utterance is considered finished. */
   hangoverMs?: number;
   /** Audio kept before speech onset. */
@@ -106,6 +108,7 @@ export class Microphone {
   private chunks: Blob[] = [];
   private preroll: Blob[] = [];
   private ducked = false;
+  private duckedUntil = 0;
   private startedDuringPlayback = false;
   private running = false;
   private readonly opts: Required<Omit<MicOptions, "referenceStream">>;
@@ -115,15 +118,16 @@ export class Microphone {
     private readonly events: MicEvents,
   ) {
     this.opts = {
-      confirmMs: opts.confirmMs ?? 320,
-      hangoverMs: opts.hangoverMs ?? 850,
+      confirmMs: opts.confirmMs ?? 220,
+      duckedConfirmMs: opts.duckedConfirmMs ?? 380,
+      hangoverMs: opts.hangoverMs ?? 550,
       prerollMs: opts.prerollMs ?? 400,
-      minUtteranceMs: opts.minUtteranceMs ?? 450,
+      minUtteranceMs: opts.minUtteranceMs ?? 380,
       maxUtteranceMs: opts.maxUtteranceMs ?? 30000,
       marginDb: opts.marginDb ?? 9,
       holdMarginDb: opts.holdMarginDb ?? 5,
-      duckedMarginDb: opts.duckedMarginDb ?? 16,
-      duckedHoldMarginDb: opts.duckedHoldMarginDb ?? 10,
+      duckedMarginDb: opts.duckedMarginDb ?? 24,
+      duckedHoldMarginDb: opts.duckedHoldMarginDb ?? 14,
     };
     this.referenceStream = opts.referenceStream;
   }
@@ -138,9 +142,19 @@ export class Microphone {
     this.referenceStream = stream;
   }
 
-  /** Raise the bar while the agent speaks, so only deliberate speech cuts in. */
+  /** Raise the bar while the agent speaks (+650ms tail) so speaker echo never self-triggers. */
   setDucked(ducked: boolean) {
-    this.ducked = ducked;
+    if (ducked) {
+      this.ducked = true;
+      this.duckedUntil = Date.now() + 650;
+    } else {
+      this.ducked = false;
+      this.duckedUntil = Date.now() + 650;
+    }
+  }
+
+  private get isDucked(): boolean {
+    return this.ducked || Date.now() < this.duckedUntil;
   }
 
   async start(): Promise<void> {
@@ -194,6 +208,8 @@ export class Microphone {
       const audio = new Audio();
       (audio as unknown as { playsInline?: boolean }).playsInline = true;
       audio.autoplay = true;
+      audio.muted = false;
+      audio.volume = 1.0;
       local.onicecandidate = (e) => e.candidate && remote.addIceCandidate(e.candidate).catch(() => undefined);
       remote.onicecandidate = (e) => e.candidate && local.addIceCandidate(e.candidate).catch(() => undefined);
       for (const track of this.referenceStream.getAudioTracks()) local.addTrack(track, this.referenceStream);
@@ -291,11 +307,13 @@ export class Microphone {
     this.energies.push(db);
     if (this.energies.length > FLOOR_WINDOW) this.energies.shift();
     const floor = noiseFloor(this.energies);
+    const duckedNow = this.isDucked;
     const margin = this.speaking
-      ? (this.ducked ? this.opts.duckedHoldMarginDb : this.opts.holdMarginDb)
-      : (this.ducked ? this.opts.duckedMarginDb : this.opts.marginDb);
+      ? (duckedNow ? this.opts.duckedHoldMarginDb : this.opts.holdMarginDb)
+      : (duckedNow ? this.opts.duckedMarginDb : this.opts.marginDb);
     const isVoice = db > floor + margin;
     const now = Date.now();
+    const confirmNeeded = duckedNow ? this.opts.duckedConfirmMs : this.opts.confirmMs;
 
     if (isVoice) {
       this.lastVoiceAt = now;
@@ -303,10 +321,10 @@ export class Microphone {
         this.speaking = true;
         this.confirmed = false;
         this.speechStartedAt = now;
-        this.startedDuringPlayback = this.ducked;
+        this.startedDuringPlayback = duckedNow;
         this.chunks = this.preroll.splice(0, this.preroll.length);
         this.events.onSpeechStart();
-      } else if (!this.confirmed && now - this.speechStartedAt >= this.opts.confirmMs) {
+      } else if (!this.confirmed && now - this.speechStartedAt >= confirmNeeded) {
         this.confirmed = true;
         this.events.onSpeechConfirmed();
       }

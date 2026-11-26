@@ -169,7 +169,7 @@ export class VoicePlayer {
   /** Synthesize the next few items while the current one plays. */
   private prefetch() {
     if (!this.opts.serverAvailable()) return;
-    for (const item of this.queue.slice(0, 3)) {
+    for (const item of this.queue.slice(0, 4)) {
       if (item.audio) continue;
       item.audio = postTts(item.utterance.text, item.utterance.lang)
         .catch((err) => {
@@ -187,7 +187,6 @@ export class VoicePlayer {
       return;
     }
     this.playing = true;
-    this.events.onStart(item.utterance);
     try {
       await this.play(item);
     } catch (err) {
@@ -272,6 +271,7 @@ export class VoicePlayer {
         },
       };
       try {
+        this.events.onStart(item.utterance);
         source.start();
       } catch (err) {
         log.warn("audio start failed", err);
@@ -347,6 +347,7 @@ export class VoicePlayer {
           advance();
         }
       };
+      this.events.onStart(item.utterance);
       speakNext(0);
     });
   }

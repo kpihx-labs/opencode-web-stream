@@ -4,9 +4,10 @@ import { createServer } from "node:http";
 import { readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULTS } from "../../dist/daemon/config.js";
+import { DEFAULTS, loadConfig } from "../../dist/daemon/config.js";
 import { OpencodeClient } from "../../dist/daemon/opencode/client.js";
 import { DecisionEngine } from "../../dist/daemon/engines/decision.js";
+import { SttEngine } from "../../dist/daemon/engines/stt.js";
 import { normalizeEdgeVoice, generateSecMsGecV2 } from "../../dist/daemon/engines/edge-tts.js";
 import { isStructuredMarkdownReport, isEchoOfSpoken } from "../../dist/daemon/core/orchestrator.js";
 import { Registry } from "../../dist/daemon/core/registry.js";
@@ -32,8 +33,8 @@ function extract(name, deps = "") {
 }
 
 test("normalizeEdgeVoice maps stale Kokoro voices and generates valid Sec-MS-GEC v2 tokens", () => {
-  assert.equal(normalizeEdgeVoice("ff_siwis", "fr"), "fr-FR-VivienneMultilingualNeural");
-  assert.equal(normalizeEdgeVoice("af_heart", "en-US"), "en-US-EmmaMultilingualNeural");
+  assert.equal(normalizeEdgeVoice("ff_siwis", "fr"), "fr-FR-DeniseNeural");
+  assert.equal(normalizeEdgeVoice("af_heart", "en-US"), "en-US-JennyNeural");
   assert.equal(normalizeEdgeVoice("fr-FR-HenriNeural", "fr"), "fr-FR-HenriNeural");
   assert.equal(
     generateSecMsGecV2(1795700000),
@@ -299,4 +300,74 @@ test("DecisionEngine detects answer_from_context when results are already on scr
     await engine.triageVoice("Présente uniquement la partie LLM", { speaking: false, busy: false, hasScreenAnswer: true }),
     "answer_from_context",
   );
+});
+
+test("loadConfig parses JSONC comments and trailing commas including streamer.models", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ows-cfg-"));
+  try {
+    const file = join(dir, "config.jsonc");
+    writeFileSync(
+      file,
+      `// JSONC comment\n{\n  /* block comment */\n  "streamer": {\n    "models": ["p1/m1", "p2/m2",],\n  },\n}\n`,
+    );
+    const cfg = loadConfig({}, file);
+    assert.deepEqual(cfg.streamer.models, ["p1/m1", "p2/m2"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("StreamerSession tries configured streamer.models in order when one fails", async () => {
+  const tried = [];
+  const fakeClient = {
+    async createSession(_dir, body) {
+      return { id: "ses_str", title: body.title, directory: "/repo", agent: "streamer", version: "2", time: { created: 1, updated: 1 } };
+    },
+    async getSession() {
+      return { id: "ses_str", title: "s", directory: "/repo", agent: "streamer", version: "2", time: { created: 1, updated: 1 } };
+    },
+    async setSessionModel() {},
+    async prompt(_sid, _dir, body) {
+      tried.push(`${body.model.providerID}/${body.model.modelID}`);
+      if (body.model.modelID === "bad-first") throw new Error("provider overloaded");
+      return { info: { id: "m1", sessionID: "ses_str", role: "assistant", time: { created: 1, completed: 2 } }, parts: [{ id: "p1", sessionID: "ses_str", messageID: "m1", type: "text", text: "<reply>Ok!</reply>" }] };
+    },
+  };
+  const dir = mkdtempSync(join(tmpdir(), "ows-order-"));
+  try {
+    const reg = new Registry(dir, 50, join(dir, "no-hex.json"));
+    const ss = new StreamerSession(
+      "ses_main",
+      "/repo",
+      "Main",
+      fakeClient,
+      reg,
+      { agent: "streamer", model: "", models: ["p1/bad-first", "p2/good-second"], summarizeEveryPrompts: 80 },
+      log,
+      { onStreamerID() {} },
+    );
+    const res = await ss.ask("voice", "salut", 5000);
+    assert.deepEqual(tried, ["p1/bad-first", "p2/good-second"]);
+    assert.equal(res?.text, "<reply>Ok!</reply>");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("isEchoOfSpoken catches short 2-word and fuzzy TTS echo snippets", () => {
+  const now = Date.now();
+  const recent = [{ text: "Voici la synthèse des avancées technologiques.", at: now - 1200 }];
+  assert.equal(isEchoOfSpoken("synthèse avancées", recent, recent[0].text, now), true);
+  assert.equal(isEchoOfSpoken("synthese technologique", recent, recent[0].text, now), true);
+  assert.equal(isEchoOfSpoken("ouvre le fichier config", recent, recent[0].text, now), false);
+});
+
+test("SttEngine toggles dynamically between hex local and browser online", async () => {
+  const stt = new SttEngine({ ...DEFAULTS.stt, mode: "hex" }, log);
+  assert.equal(stt.mode, "hex");
+  assert.equal(await stt.check(true), true);
+  assert.equal(stt.describe().engine, "hex");
+  stt.setMode("browser");
+  assert.equal(await stt.check(true), false);
+  assert.equal(stt.describe().engine, "browser");
 });

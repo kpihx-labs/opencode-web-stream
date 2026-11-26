@@ -1,18 +1,28 @@
+import { execFile as execFileCb } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import type { Config } from "../config.js";
 import type { ScopedLogger } from "../log.js";
 import { originOf } from "./tts.js";
 
+const execFile = promisify(execFileCb);
+
+export type SttMode = "auto" | "hex" | "browser" | "url";
+
 /**
- * Transcription through an OpenAI-compatible `/v1/audio/transcriptions`
- * endpoint (speaches, faster-whisper-server, whisper.cpp server, ...). The
- * project vocabulary is passed as the Whisper `prompt`, which biases the
- * decoder toward those spellings.
+ * Transcription supporting:
+ *   1. Local Hex CLI (`hex transcribe <file> --model orukeet --json`, default),
+ *   2. OpenAI-compatible `/v1/audio/transcriptions` endpoint (`cfg.stt.url`),
+ *   3. Browser online Web Speech API (`mode: "browser"` -> `ready: false`).
  */
 
 export class SttEngine {
   private ready = false;
   private lastCheck = 0;
   private checking?: Promise<boolean>;
+  private hexAvailable: boolean | undefined;
 
   constructor(
     private readonly cfg: Config["stt"],
@@ -20,8 +30,30 @@ export class SttEngine {
     private readonly fetchImpl: typeof fetch = fetch,
   ) {}
 
+  get mode(): SttMode {
+    return this.cfg.mode ?? "hex";
+  }
+
+  setMode(next: SttMode) {
+    if (this.cfg.mode === next) return;
+    this.cfg.mode = next;
+    this.lastCheck = 0;
+    this.log.info("stt mode changed", { mode: next });
+  }
+
+  private effectiveEngine(): "hex" | "server" | "browser" {
+    const m = this.mode;
+    if (m === "browser") return "browser";
+    if (m === "url") return this.cfg.url ? "server" : "browser";
+    if (m === "hex") return "hex";
+    // auto
+    if (this.cfg.url) return "server";
+    return "hex";
+  }
+
   get enabled(): boolean {
-    return Boolean(this.cfg.url);
+    const eff = this.effectiveEngine();
+    return eff === "hex" || (eff === "server" && Boolean(this.cfg.url));
   }
 
   get isReady(): boolean {
@@ -29,30 +61,61 @@ export class SttEngine {
   }
 
   describe() {
-    return { engine: this.isReady ? ("server" as const) : ("browser" as const), ready: this.isReady };
+    const eff = this.effectiveEngine();
+    return {
+      engine: this.isReady ? eff : ("browser" as const),
+      ready: this.isReady,
+      mode: this.mode,
+      model: this.cfg.model,
+    };
   }
 
   async check(force = false): Promise<boolean> {
-    if (!this.enabled) return false;
+    const eff = this.effectiveEngine();
+    if (eff === "browser") {
+      this.ready = false;
+      this.lastCheck = Date.now();
+      return false;
+    }
     const now = Date.now();
     if (!force && now - this.lastCheck < 30000) return this.ready;
     if (this.checking) return this.checking;
     this.checking = (async () => {
-      const base = originOf(this.cfg.url);
       let ok = false;
-      for (const url of [`${base}/health`, `${base}/v1/models`, base + "/"]) {
-        try {
-          const res = await this.fetchImpl(url, { signal: AbortSignal.timeout(2500) });
-          if (res.ok || res.status === 404 || res.status === 405) {
-            ok = true;
-            break;
+      if (eff === "hex") {
+        if (this.hexAvailable === undefined || force) {
+          try {
+            const { stdout } = await execFile(this.cfg.binary || "hex", ["--version"], { timeout: 2500 });
+            ok = Boolean(stdout.trim());
+          } catch {
+            ok = false;
           }
-        } catch {
-          // next probe
+          this.hexAvailable = ok;
+        } else {
+          ok = this.hexAvailable;
+        }
+      } else if (this.cfg.url) {
+        const base = originOf(this.cfg.url);
+        for (const url of [`${base}/health`, `${base}/v1/models`, base + "/"]) {
+          try {
+            const res = await this.fetchImpl(url, { signal: AbortSignal.timeout(2500) });
+            if (res.ok || res.status === 404 || res.status === 405) {
+              ok = true;
+              break;
+            }
+          } catch {
+            // next probe
+          }
         }
       }
       this.lastCheck = Date.now();
-      if (ok !== this.ready) this.log.info(ok ? "stt endpoint reachable" : "stt endpoint unreachable", { url: this.cfg.url });
+      if (ok !== this.ready) {
+        this.log.info(ok ? "stt engine ready" : "stt engine unavailable (browser fallback)", {
+          engine: eff,
+          model: this.cfg.model,
+          url: this.cfg.url || undefined,
+        });
+      }
       this.ready = ok;
       this.checking = undefined;
       return ok;
@@ -61,15 +124,20 @@ export class SttEngine {
   }
 
   /**
-   * @param audio WAV (or any container the server accepts) bytes.
-   * @param promptTerms vocabulary to bias toward; joined into the Whisper prompt.
-   * @returns the transcript and, when the server reports it, the detected language.
+   * @param audio WebM/WAV/MP3/Ogg bytes.
+   * @param promptTerms vocabulary to bias toward when using an HTTP Whisper endpoint.
+   * @returns the transcript and, when reported, the detected language.
    */
   async transcribe(
     audio: Buffer,
     opts: { mime?: string; language?: string; promptTerms?: string[]; signal?: AbortSignal } = {},
   ): Promise<{ text: string; language?: string }> {
-    if (!this.enabled) throw new Error("server stt disabled");
+    const eff = this.effectiveEngine();
+    if (eff === "browser") throw new Error("server stt disabled (browser mode)");
+    if (eff === "hex") {
+      return this.transcribeHex(audio, opts);
+    }
+    if (!this.cfg.url) throw new Error("server stt disabled");
     const form = new FormData();
     const mime = opts.mime ?? "audio/wav";
     const ext = mime.includes("webm") ? "webm" : mime.includes("ogg") ? "ogg" : mime.includes("mp3") || mime.includes("mpeg") ? "mp3" : "wav";
@@ -100,6 +168,48 @@ export class SttEngine {
     } finally {
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  private async transcribeHex(
+    audio: Buffer,
+    opts: { mime?: string; language?: string; signal?: AbortSignal },
+  ): Promise<{ text: string; language?: string }> {
+    const t0 = Date.now();
+    const mime = opts.mime ?? "audio/webm";
+    const ext = mime.includes("wav") ? "wav" : mime.includes("ogg") ? "ogg" : mime.includes("mp3") || mime.includes("mpeg") ? "mp3" : "webm";
+    const dir = "/tmp/opencode";
+    await mkdir(dir, { recursive: true });
+    const tmpPath = join(dir, `ows-stt-${randomUUID()}.${ext}`);
+    await writeFile(tmpPath, audio);
+    try {
+      const model = this.cfg.model || "orukeet";
+      const args = ["transcribe", tmpPath, "--model", model, "--json"];
+      const langRaw = opts.language ?? this.cfg.language;
+      const lang = langRaw && langRaw !== "auto" ? langRaw.toLowerCase().split(/[-_]/)[0] : "";
+      if (lang && model !== "orukeet") args.push("--language", lang);
+      const { stdout } = await execFile(this.cfg.binary || "hex", args, {
+        timeout: this.cfg.timeoutMs,
+        signal: opts.signal,
+      });
+      const parsed = JSON.parse(stdout) as { text?: string };
+      const text = (parsed.text ?? "").trim();
+      this.ready = true;
+      this.log.debug("hex stt ok", {
+        model,
+        bytes: audio.length,
+        elapsedMs: Date.now() - t0,
+        text: text.slice(0, 120),
+      });
+      return { text, language: lang || undefined };
+    } catch (e) {
+      this.log.warn("hex stt failed", {
+        elapsedMs: Date.now() - t0,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      throw e;
+    } finally {
+      await unlink(tmpPath).catch(() => undefined);
     }
   }
 }

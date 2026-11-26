@@ -35,7 +35,7 @@ export type Outbound = {
   /** Send to every cockpit attached to the session. */
   toSession(sessionID: string, msg: ServerMessage): void;
   /** Move every cockpit sitting on `from` onto `to`, then notify them. */
-  rebind(from: string, to: string, msg: ServerMessage): void;
+  rebind(from: string, to: string, msg: ServerMessage, directory?: string): void;
   /** Send to the cockpit currently elected speaker for the session (or a fallback in the directory). */
   speak(utterance: Utterance): void;
   /** Sessions in the same directory that have a live cockpit, for cross-session notices. */
@@ -370,6 +370,7 @@ export class Orchestrator {
         {
           agent: this.cfg.streamer.agent,
           model: this.cfg.streamer.model,
+          models: this.cfg.streamer.models,
           mainModel: s.model,
           summarizeEveryPrompts: this.cfg.streamer.summarizeEveryPrompts,
         },
@@ -954,7 +955,13 @@ export class Orchestrator {
     for (const sentence of sentences) this.emitInflight(s, speech, sentence, expiresAt);
     const untagged = kind === "beat" ? "quiet" : "say";
     const decisions = parseStreamerOutput(result.text, { untagged });
-    this.log.debug("streamer decided", { kind, sessionID: s.id, decisions: decisions.map((d) => d.kind).join(","), spoke: speech.spoke });
+    this.log.debug("streamer decided", {
+      kind,
+      sessionID: s.id,
+      decisions: decisions.map((d) => d.kind).join(","),
+      spoke: speech.spoke,
+      raw: result.text.slice(0, 240),
+    });
     return { decisions, spoke: speech.spoke };
   }
 
@@ -1122,8 +1129,10 @@ export class Orchestrator {
       sessionID = created;
     }
     const s = this.sessions.get(sessionID) ?? this.ensureSession(sessionID, opts.directory ?? "");
-    if (isEchoOfSpoken(raw, s.recentSpoken, s.lastSpoken)) {
+    const echoPool = opts.spokenOver ? [...s.recentSpoken, { text: opts.spokenOver, at: Date.now() }] : s.recentSpoken;
+    if (isEchoOfSpoken(raw, echoPool, s.lastSpoken)) {
       this.log.debug("ignoring self-echo transcript", { sessionID: s.id, raw: raw.slice(0, 120) });
+      this.out.toSession(s.id, { type: "heard", sessionID: s.id, raw, corrected: raw, decision: "echo(ignored)" });
       if (opts.bargeIn || s.phase === "interrupted") {
         this.out.toSession(s.id, { type: "resume", sessionID: s.id });
         this.setPhase(s, "speaking");
@@ -1234,12 +1243,17 @@ export class Orchestrator {
       this.applySessionInfo(s, created);
       s.live = true;
       this.log.info("session created for a voice turn", { sessionID: created.id, directory: dir });
-      this.out.rebind("", created.id, {
-        type: "navigate",
-        sessionID: created.id,
-        directory: created.directory || dir,
-        url: sessionUrl(created.directory || dir, created.id),
-      });
+      this.out.rebind(
+        "",
+        created.id,
+        {
+          type: "navigate",
+          sessionID: created.id,
+          directory: created.directory || dir,
+          url: sessionUrl(created.directory || dir, created.id),
+        },
+        created.directory || dir,
+      );
       this.setPhase(s, "thinking");
       await this.startStreamer(s);
       return created.id;
@@ -1453,8 +1467,9 @@ export function isStructuredMarkdownReport(text: string): boolean {
 }
 
 /**
- * Detect when the browser's microphone recognizer transcribed the agent's own
- * TTS voice bleeding from the speakers.
+ * Detect when the microphone transcribed the agent's own TTS voice bleeding
+ * from the speakers. Catches short snippets (2+ words within active window)
+ * and slight STT mishearings via normalized prefix/token overlap.
  */
 export function isEchoOfSpoken(
   transcript: string,
@@ -1463,17 +1478,28 @@ export function isEchoOfSpoken(
   now = Date.now(),
 ): boolean {
   const words = tokenizeEchoWords(transcript);
-  if (words.length < 4) return false;
-  const recentTexts = recentSpoken.filter((r) => now - r.at <= 25000).map((r) => r.text);
+  if (words.length < 2) return false;
+  const recentActive = recentSpoken.filter((r) => now - r.at <= 25000);
+  const veryRecent = recentSpoken.some((r) => now - r.at <= 8000);
+  if (words.length < 4 && !veryRecent && !lastSpoken) return false;
+  const recentTexts = recentActive.map((r) => r.text);
   if (lastSpoken) recentTexts.push(lastSpoken);
   if (!recentTexts.length) return false;
-  const spokenPool = new Set(tokenizeEchoWords(recentTexts.join(" ")));
-  if (spokenPool.size < 4) return false;
+  const spokenWords = tokenizeEchoWords(recentTexts.join(" "));
+  const spokenPool = new Set(spokenWords);
+  if (spokenPool.size < 2) return false;
   let hits = 0;
   for (const w of words) {
-    if (spokenPool.has(w)) hits += 1;
+    if (spokenPool.has(w)) {
+      hits += 1;
+      continue;
+    }
+    if (w.length >= 4 && spokenWords.some((sw) => sw.length >= 4 && (sw.startsWith(w.slice(0, 4)) || w.startsWith(sw.slice(0, 4))))) {
+      hits += 0.85;
+    }
   }
-  return hits / words.length >= 0.6;
+  const threshold = words.length <= 3 ? 0.65 : 0.55;
+  return hits / words.length >= threshold;
 }
 
 /** Strip residual Markdown/formatting from spoken replies so TTS never reads asterisks or hashes aloud. */
@@ -1493,5 +1519,5 @@ function tokenizeEchoWords(text: string): string[] {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .split(/[^a-z0-9]+/)
-    .filter((w) => w.length >= 3);
+    .filter((w) => w.length >= 2);
 }

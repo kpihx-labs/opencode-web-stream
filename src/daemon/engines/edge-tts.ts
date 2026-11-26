@@ -270,7 +270,7 @@ function generateMuid(): string {
 }
 
 function dateToString(): string {
-  return new Date().toUTCString().replace("GMT", "UTC");
+  return new Date().toUTCString().replace("GMT", "GMT+0000 (Coordinated Universal Time)");
 }
 
 function escapeXml(text: string): string {
@@ -320,8 +320,115 @@ export function adjustClockSkewFromDateHeader(dateHeader: string | undefined, no
 export function normalizeEdgeVoice(voice: string | undefined, lang?: string): string {
   if (voice && /^[a-z]{2,3}-[A-Z]{2}-.*Neural$/i.test(voice)) return voice;
   const code = (lang ?? "").toLowerCase().split(/[-_]/)[0];
-  if (code === "en") return "en-US-EmmaMultilingualNeural";
-  return "fr-FR-VivienneMultilingualNeural";
+  if (code === "en") return "en-US-JennyNeural";
+  return "fr-FR-DeniseNeural";
+}
+
+type WarmEdgeSocket = {
+  ws: WebSocket;
+  ready: boolean;
+  openedAt: number;
+};
+
+let warmSlot: WarmEdgeSocket | undefined;
+let warmConnecting = false;
+
+function buildEdgeUrl(): string {
+  const connId = randomUUID().replace(/-/g, "");
+  return (
+    `${WSS_BASE}?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}` +
+    `&ConnectionId=${connId}` +
+    `&Sec-MS-GEC=${generateSecMsGecV2()}` +
+    `&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}`
+  );
+}
+
+function openEdgeSocket(): WebSocket {
+  return new WebSocket(buildEdgeUrl(), {
+    agent: edgeHttpsAgent,
+    family: 4,
+    // CRITICAL: ws permessage-deflate stalls Microsoft Read Aloud frames by 5-12s!
+    perMessageDeflate: false,
+    headers: {
+      Pragma: "no-cache",
+      "Cache-Control": "no-cache",
+      Origin: "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
+      "Accept-Encoding": "gzip, deflate, br, zstd",
+      "Accept-Language": "en-US,en;q=0.9",
+      "User-Agent": `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0`,
+      Cookie: `muid=${generateMuid()};`,
+    },
+  });
+}
+
+function speechConfigMessage(): string {
+  return (
+    `X-Timestamp:${dateToString()}\r\n` +
+    "Content-Type:application/json; charset=utf-8\r\n" +
+    "Path:speech.config\r\n\r\n" +
+    '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"true"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n'
+  );
+}
+
+/** Pre-open a standby WebSocket with speech.config sent so the next TTS starts immediately. */
+export function prewarmEdgeTts(): void {
+  if (warmConnecting) return;
+  if (warmSlot && warmSlot.ws.readyState <= WebSocket.OPEN && Date.now() - warmSlot.openedAt < 35_000) return;
+  if (warmSlot) {
+    try {
+      warmSlot.ws.terminate();
+    } catch {
+      // ignore
+    }
+    warmSlot = undefined;
+  }
+  warmConnecting = true;
+  const ws = openEdgeSocket();
+  const entry: WarmEdgeSocket = { ws, ready: false, openedAt: Date.now() };
+  warmSlot = entry;
+  const drop = () => {
+    warmConnecting = false;
+    if (warmSlot === entry) warmSlot = undefined;
+  };
+  ws.once("open", () => {
+    warmConnecting = false;
+    if (warmSlot !== entry) {
+      try {
+        ws.terminate();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    entry.ready = true;
+    entry.openedAt = Date.now();
+    try {
+      ws.send(speechConfigMessage());
+    } catch {
+      drop();
+    }
+  });
+  ws.once("unexpected-response", (_req, res) => {
+    if (res.statusCode === 403 && typeof res.headers.date === "string") adjustClockSkewFromDateHeader(res.headers.date);
+    drop();
+  });
+  ws.once("error", drop);
+  ws.once("close", drop);
+}
+
+function takeWarmEdgeSocket(): { ws: WebSocket; preconfigured: boolean } {
+  const entry = warmSlot;
+  if (entry && entry.ready && entry.ws.readyState === WebSocket.OPEN && Date.now() - entry.openedAt < 35_000) {
+    warmSlot = undefined;
+    entry.ws.removeAllListeners("error");
+    entry.ws.removeAllListeners("close");
+    entry.ws.removeAllListeners("unexpected-response");
+    // Immediately replenish the standby socket for the next sentence.
+    queueMicrotask(() => prewarmEdgeTts());
+    return { ws: entry.ws, preconfigured: true };
+  }
+  queueMicrotask(() => prewarmEdgeTts());
+  return { ws: openEdgeSocket(), preconfigured: false };
 }
 
 export async function synthesizeEdgeTts(
@@ -356,26 +463,7 @@ function runEdgeWs(
   outerSignal?: AbortSignal,
 ): Promise<EdgeTtsOutput> {
   return new Promise((resolve, reject) => {
-    const connId = randomUUID().replace(/-/g, "");
-    const url =
-      `${WSS_BASE}?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}` +
-      `&ConnectionId=${connId}` +
-      `&Sec-MS-GEC=${generateSecMsGecV2()}` +
-      `&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}`;
-
-    const ws = new WebSocket(url, {
-      agent: edgeHttpsAgent,
-      family: 4,
-      headers: {
-        Pragma: "no-cache",
-        "Cache-Control": "no-cache",
-        Origin: "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Accept-Language": "en-US,en;q=0.9",
-        "User-Agent": `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0`,
-        Cookie: `muid=${generateMuid()};`,
-      },
-    });
+    const { ws, preconfigured } = takeWarmEdgeSocket();
 
     const audioChunks: Buffer[] = [];
     const boundaries: WordBoundary[] = [];
@@ -433,23 +521,25 @@ function runEdgeWs(
       }
     });
 
-    ws.on("open", () => {
-      const cfgMsg =
-        `X-Timestamp:${dateToString()}\r\n` +
-        "Content-Type:application/json; charset=utf-8\r\n" +
-        "Path:speech.config\r\n\r\n" +
-        '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"true"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n';
-      ws.send(cfgMsg);
-
+    const sendSsml = () => {
       const ssml = buildSsml(text, voice, rate);
       const ssmlMsg =
         `X-RequestId:${randomUUID().replace(/-/g, "")}\r\n` +
         "Content-Type:application/ssml+xml\r\n" +
-        `X-Timestamp:${dateToString()}Z\r\n` +
+        `X-Timestamp:${dateToString()}\r\n` +
         "Path:ssml\r\n\r\n" +
         ssml;
       ws.send(ssmlMsg);
-    });
+    };
+
+    if (preconfigured) {
+      sendSsml();
+    } else {
+      ws.on("open", () => {
+        ws.send(speechConfigMessage());
+        sendSsml();
+      });
+    }
 
     ws.on("message", (data, isBinary) => {
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data));

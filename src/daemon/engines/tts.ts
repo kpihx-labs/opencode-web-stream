@@ -1,6 +1,6 @@
 import type { Config } from "../config.js";
 import type { ScopedLogger } from "../log.js";
-import { synthesizeEdgeTts, type WordBoundary } from "./edge-tts.js";
+import { prewarmEdgeTts, synthesizeEdgeTts, type WordBoundary } from "./edge-tts.js";
 
 /**
  * Speech synthesis supporting:
@@ -58,6 +58,7 @@ export class TtsEngine {
     if (!this.enabled) return false;
     if (this.usesBuiltInEdge) {
       this.ready = true;
+      prewarmEdgeTts();
       return true;
     }
     const now = Date.now();
@@ -96,6 +97,7 @@ export class TtsEngine {
     const speed = opts.speed ?? this.cfg.speed;
 
     if (this.usesBuiltInEdge) {
+      const t0 = Date.now();
       try {
         const out = await synthesizeEdgeTts(text, {
           voice,
@@ -105,9 +107,11 @@ export class TtsEngine {
           signal: opts.signal,
         });
         this.ready = true;
+        this.log.debug("edge-tts ok", { voice, chars: text.length, bytes: out.bytes.length, elapsedMs: Date.now() - t0 });
         return out;
       } catch (e) {
         this.ready = false;
+        this.log.warn("edge-tts failed", { voice, elapsedMs: Date.now() - t0, error: e instanceof Error ? e.message : String(e) });
         throw e;
       }
     }

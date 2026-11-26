@@ -54,8 +54,14 @@ export class BrowserRecognizer {
   private wantRunning = false;
   private restartTimer?: number;
   private watchdogTimer?: number;
+  private interimCommitTimer?: number;
   private consecutiveErrors = 0;
   private generation = 0;
+  private sessionStartedAt = 0;
+  private pendingInterim = "";
+  private lastInterimAt = 0;
+  private lastCommittedText = "";
+  private lastCommittedAt = 0;
   private lang = "fr-FR";
   private phrases: string[] = [];
   private onDeviceReady = false;
@@ -172,12 +178,25 @@ export class BrowserRecognizer {
         if (!alternative) continue;
         if (result.isFinal) {
           const text = alternative.transcript.trim();
-          if (text) this.events.onFinal(text, alternative.confidence ?? 0);
+          this.pendingInterim = "";
+          if (this.interimCommitTimer) {
+            window.clearTimeout(this.interimCommitTimer);
+            this.interimCommitTimer = undefined;
+          }
+          if (text && !this.isDuplicateCommit(text)) {
+            this.markCommitted(text);
+            this.events.onFinal(text, alternative.confidence ?? 0);
+          }
         } else {
           interim += alternative.transcript;
         }
       }
-      if (interim.trim()) this.events.onInterim(interim.trim());
+      const cleanInterim = interim.trim();
+      if (cleanInterim) {
+        this.pendingInterim = cleanInterim;
+        this.lastInterimAt = Date.now();
+        this.events.onInterim(cleanInterim);
+      }
     };
     recognition.onerror = (event) => {
       if (seq !== this.generation) return;
@@ -212,17 +231,24 @@ export class BrowserRecognizer {
         }
         return;
       }
-      this.consecutiveErrors += 1;
+      // Preserve any spoken interim text before Edge drops the stream on network idle.
+      this.flushPendingInterim("error");
+      if (error === "network" && Date.now() - this.sessionStartedAt > 8000) {
+        this.consecutiveErrors = 0;
+      } else {
+        this.consecutiveErrors += 1;
+      }
       log.warn("recognition error", error, event.message ?? "");
       this.events.onError(error);
       if (error === "not-allowed" || error === "service-not-allowed") this.wantRunning = false;
     };
     recognition.onend = () => {
       if (seq !== this.generation) return;
+      this.flushPendingInterim("end");
       this.recognition = undefined;
       if (!this.wantRunning) return;
       // Keep recovery snappy so mid-session resets never drop the user's next sentence.
-      const delay = this.consecutiveErrors > 2 ? Math.min(400 * 2 ** (this.consecutiveErrors - 2), 5000) : 80;
+      const delay = this.consecutiveErrors > 2 ? Math.min(400 * 2 ** (this.consecutiveErrors - 2), 5000) : 60;
       this.restartTimer = window.setTimeout(() => {
         this.restartTimer = undefined;
         this.spawn();
@@ -230,6 +256,7 @@ export class BrowserRecognizer {
     };
     recognition.onstart = () => {
       this.consecutiveErrors = 0;
+      this.sessionStartedAt = Date.now();
     };
     this.recognition = recognition;
     try {
@@ -259,9 +286,53 @@ export class BrowserRecognizer {
     }
   }
 
+  /**
+   * Called when our AudioWorklet VAD confirms silence after speech: nudge Chromium
+   * to flush `isFinal` immediately instead of waiting ~2 s, with a fast fallback.
+   */
+  commitInterim() {
+    if (!this.wantRunning || !this.pendingInterim) return;
+    if (Date.now() - this.lastInterimAt < 180) return;
+    if (this.interimCommitTimer) return;
+    try {
+      this.recognition?.stop();
+    } catch {
+      // ignore
+    }
+    this.interimCommitTimer = window.setTimeout(() => {
+      this.interimCommitTimer = undefined;
+      this.flushPendingInterim("vad-silence");
+    }, 220);
+  }
+
+  private flushPendingInterim(reason: string) {
+    if (this.interimCommitTimer) {
+      window.clearTimeout(this.interimCommitTimer);
+      this.interimCommitTimer = undefined;
+    }
+    const text = this.pendingInterim.trim();
+    this.pendingInterim = "";
+    if (!text || this.isDuplicateCommit(text)) return;
+    this.markCommitted(text);
+    log.debug("flushed interim transcript", { reason, text: text.slice(0, 80) });
+    this.events.onFinal(text, 0.75);
+  }
+
+  private markCommitted(text: string) {
+    this.lastCommittedText = text.toLowerCase();
+    this.lastCommittedAt = Date.now();
+  }
+
+  private isDuplicateCommit(text: string): boolean {
+    return Date.now() - this.lastCommittedAt < 2500 && text.toLowerCase() === this.lastCommittedText;
+  }
+
   stop() {
     this.generation += 1;
     this.wantRunning = false;
+    this.pendingInterim = "";
+    if (this.interimCommitTimer) window.clearTimeout(this.interimCommitTimer);
+    this.interimCommitTimer = undefined;
     if (this.watchdogTimer) window.clearInterval(this.watchdogTimer);
     this.watchdogTimer = undefined;
     if (this.restartTimer) window.clearTimeout(this.restartTimer);

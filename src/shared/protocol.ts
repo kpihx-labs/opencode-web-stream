@@ -75,7 +75,7 @@ export type DaemonStatus = {
   protocol: number;
   opencode: { connected: boolean; url: string; lastError?: string };
   tts: { engine: "server" | "browser"; ready: boolean; voice?: string };
-  stt: { engine: "browser" | "server"; ready: boolean };
+  stt: { engine: "browser" | "server" | "hex"; ready: boolean; mode?: "auto" | "hex" | "browser" | "url"; model?: string };
   decision?: { enabled: boolean; ready: boolean; model: string; url: string };
   /** Languages the daemon is configured for; the cockpit offers these plus "auto". */
   speech: { languages: string[]; default: string };
@@ -150,6 +150,8 @@ export type ClientMessage =
   | { type: "visible"; sessionID: string; visible: boolean }
   /** Cancel a scheduled injection before it executes. */
   | { type: "cancel_inject"; sessionID: string; injectId: string }
+  /** Switch STT backend dynamically between local Hex and online Browser Web Speech. */
+  | { type: "stt_mode"; mode: "auto" | "hex" | "browser" | "url" }
   | { type: "ping"; t: number };
 
 /** Server-sent speech chunk sizes; kept here so both sides agree. */

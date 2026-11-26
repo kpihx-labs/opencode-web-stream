@@ -54,6 +54,7 @@ class CockpitApp {
   private digest = false;
   private serverEars = false;
   private serverVoice = false;
+  private sttEngine: "browser" | "server" | "hex" = "hex";
   private unlocked = false;
   private speakingUtterance?: string;
   private recentSpoken: Array<{ text: string; at: number }> = [];
@@ -87,6 +88,7 @@ class CockpitApp {
         this.ui.update({ digest: this.digest });
       },
       onCycleLang: () => this.cycleLanguage(),
+      onToggleSttMode: () => this.toggleSttMode(),
     });
 
     this.player = new VoicePlayer(
@@ -176,29 +178,32 @@ class CockpitApp {
     const next = sessionIdFromLocation();
     const nextDirectory = resolveWorkspaceDirectory(next);
     if (nextDirectory && nextDirectory !== this.directory) {
-      const hadNoDir = !this.directory;
       this.directory = nextDirectory;
       this.link.attach(this.sessionID, this.directory, !document.hidden);
       this.refreshDirState();
-      // The daemon refused live for lack of a folder; now that we have one,
-      // ask again so the armed state follows without another click.
-      if (hadNoDir && this.live) this.link.send({ type: "live", sessionID: this.sessionID, enabled: true, directory: this.directory });
+      if (this.live) {
+        this.link.send({ type: "live", sessionID: this.sessionID, enabled: true, directory: this.directory, lang: this.transcriptLang() });
+      }
     }
     if (next === this.sessionID) return;
     // Arriving on a session we just created: keep listening, do not tear down.
     if (next && this.sessionID === "") {
-      log.info("new session materialised", { sessionID: next });
+      log.info("new session materialised", { sessionID: next, directory: this.directory });
       this.sessionID = next;
       this.link.attach(next, this.directory, !document.hidden);
       return;
     }
-    if (!next) return;
-    log.info("session changed", { from: this.sessionID, to: next });
+    log.info("session changed", { from: this.sessionID || "(new)", to: next || "(new-session)", directory: nextDirectory });
     const wasLive = this.live;
-    if (wasLive) void this.stopListening();
-    this.link.send({ type: "detach", sessionID: this.sessionID });
+    if (wasLive) {
+      this.live = false;
+      void this.stopListening();
+    }
+    if (this.sessionID) this.link.send({ type: "detach", sessionID: this.sessionID });
     this.player.cancel();
     this.sessionID = next;
+    if (nextDirectory) this.directory = nextDirectory;
+    this.refreshDirState();
     this.link.attach(next, this.directory, !document.hidden);
     if (wasLive) void this.toggleLive(true);
   }
@@ -212,14 +217,40 @@ class CockpitApp {
     try {
       const res = await fetch(DaemonLink.apiUrl("/api/status"));
       if (!res.ok) return;
-      const status = (await res.json()) as { tts: { ready: boolean }; stt: { ready: boolean }; speech?: { languages: string[] } };
+      const status = (await res.json()) as {
+        tts: { ready: boolean };
+        stt: { engine?: "browser" | "server" | "hex"; ready: boolean };
+        speech?: { languages: string[] };
+      };
       this.serverVoice = status.tts.ready;
-      this.serverEars = status.stt.ready;
+      this.applySttStatus(status.stt);
       if (status.speech?.languages?.length) this.languages = status.speech.languages;
-      this.ui.update({ serverVoice: this.serverVoice, serverEars: this.serverEars });
+      this.ui.update({ serverVoice: this.serverVoice, serverEars: this.serverEars, sttEngine: this.sttEngine });
     } catch {
       // The websocket carries status too; this is only a faster first read.
     }
+  }
+
+  private applySttStatus(stt: { engine?: "browser" | "server" | "hex"; ready: boolean }) {
+    const prevEars = this.serverEars;
+    this.serverEars = stt.ready;
+    this.sttEngine = stt.engine ?? (stt.ready ? "hex" : "browser");
+    if (!this.live || prevEars === this.serverEars) return;
+    if (this.serverEars) {
+      if (this.recognizer) {
+        this.recognizer.stop();
+        this.recognizer = undefined;
+        log.info("switched to local server STT", { engine: this.sttEngine });
+      }
+    } else if (!this.recognizer && BrowserRecognizer.supported) {
+      void this.startBrowserRecognition();
+    }
+  }
+
+  private toggleSttMode() {
+    const next = this.serverEars ? "browser" : "hex";
+    log.info("toggling STT mode", { from: this.sttEngine, to: next });
+    this.link.send({ type: "stt_mode", mode: next });
   }
 
   private async unlockAudio() {
@@ -332,6 +363,7 @@ class CockpitApp {
         onSpeechConfirmed: () => this.onBargeIn(),
         onUtterance: (blob, meta) => void this.onUtterance(blob, meta),
         onSilence: () => {
+          this.recognizer?.commitInterim();
           if (!this.player.isPlaying) this.ui.update({ state: "listening" });
         },
         onLevel: (level) => this.ui.setLevel(level),
@@ -418,8 +450,8 @@ class CockpitApp {
         { sessionID: this.sessionID, directory: this.directory, lang: this.transcriptLang(), bargeIn, spokenOver: context.spokenOver, apply: true },
         controller.signal,
       );
-      if (!result.text) {
-        log.debug("empty transcript");
+      if (!result.text || result.decision === "echo" || result.decision === "quiet") {
+        log.debug("stt utterance did not interrupt", { text: result.text?.slice(0, 60), decision: result.decision });
         if (bargeIn) this.player.resume();
       }
     } catch (err) {
@@ -446,36 +478,42 @@ class CockpitApp {
     log.info("switched to browser recognition", { lang: this.recognizerLang() });
   }
 
-  private isSelfEcho(text: string): boolean {
+  private isSelfEcho(text: string, spokenOver?: string): boolean {
     const now = Date.now();
-    if (!this.player.isPlaying && now - this.lastSpokeAt > 12000) return false;
-    const words = text
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .split(/[^a-z0-9]+/)
-      .filter((w) => w.length >= 3);
-    if (words.length < 4) return false;
-    const pool = new Set(
-      this.recentSpoken
-        .filter((r) => now - r.at <= 25000)
-        .map((r) => r.text)
-        .join(" ")
+    const activeWindow = this.player.isPlaying || now - this.lastSpokeAt <= 8000;
+    if (!activeWindow && now - this.lastSpokeAt > 15000) return false;
+    const tokenize = (s: string) =>
+      s
         .toLowerCase()
         .normalize("NFD")
         .replace(/[\u0300-\u036f]/g, "")
         .split(/[^a-z0-9]+/)
-        .filter((w) => w.length >= 3),
-    );
-    if (pool.size < 4) return false;
+        .filter((w) => w.length >= 2);
+    const words = tokenize(text);
+    if (words.length < 2) return false;
+    if (words.length < 4 && !activeWindow) return false;
+    const poolTexts = this.recentSpoken.filter((r) => now - r.at <= 25000).map((r) => r.text);
+    if (spokenOver) poolTexts.push(spokenOver);
+    const poolWords = tokenize(poolTexts.join(" "));
+    const pool = new Set(poolWords);
+    if (pool.size < 2) return false;
     let hits = 0;
-    for (const w of words) if (pool.has(w)) hits += 1;
-    return hits / words.length >= 0.6;
+    for (const w of words) {
+      if (pool.has(w)) {
+        hits += 1;
+        continue;
+      }
+      if (w.length >= 4 && poolWords.some((sw) => sw.length >= 4 && (sw.startsWith(w.slice(0, 4)) || w.startsWith(sw.slice(0, 4))))) {
+        hits += 0.85;
+      }
+    }
+    const threshold = words.length <= 3 ? 0.65 : 0.55;
+    return hits / words.length >= threshold;
   }
 
   private async submitTranscript(text: string, context: { bargeIn: boolean; spokenOver?: string }) {
     if (!text.trim() || !this.live) return;
-    if (this.isSelfEcho(text)) {
+    if (this.isSelfEcho(text, context.spokenOver)) {
       log.debug("dropped client self-echo", { text: text.slice(0, 80) });
       if (context.bargeIn) {
         this.link.send({ type: "barge_in_false", sessionID: this.sessionID });
@@ -483,9 +521,12 @@ class CockpitApp {
       }
       return;
     }
-    // User spoke a real follow-up: stop any remaining answer/beat chunks immediately.
-    this.player.cancel({ kind: "answer" });
-    this.player.cancel({ kind: "beat" });
+    // Pause playback if still speaking; the daemon will send `cancel` (real user intent)
+    // or `resume` (if daemon-side echo/noise gate catches it), preserving full TTS on false alarms.
+    if (this.player.isPlaying && !context.bargeIn) {
+      const heard = this.player.interrupt();
+      context = { bargeIn: true, spokenOver: heard || context.spokenOver };
+    }
     this.ui.update({ state: "thinking" });
     this.link.send({
       type: "transcript",
@@ -506,9 +547,9 @@ class CockpitApp {
       case "hello":
       case "status": {
         this.serverVoice = msg.status.tts.ready;
-        this.serverEars = msg.status.stt.ready;
+        this.applySttStatus(msg.status.stt);
         if (msg.status.speech?.languages?.length) this.languages = msg.status.speech.languages;
-        this.ui.update({ connected: msg.status.opencode.connected, serverVoice: this.serverVoice, serverEars: this.serverEars });
+        this.ui.update({ connected: msg.status.opencode.connected, serverVoice: this.serverVoice, serverEars: this.serverEars, sttEngine: this.sttEngine });
         return;
       }
       case "state": {

@@ -19,6 +19,7 @@ export type UiCallbacks = {
   onRepeat: () => void;
   onToggleDigest: () => void;
   onCycleLang: () => void;
+  onToggleSttMode: () => void;
 };
 
 export type UiState = {
@@ -29,6 +30,7 @@ export type UiState = {
   state: LiveState;
   serverVoice: boolean;
   serverEars: boolean;
+  sttEngine: "browser" | "server" | "hex";
   /** "fr-FR", "en-US" or "auto": what the recognizer is asked to hear. */
   lang: string;
   /** True when live cannot start server-side: new session, no known directory. */
@@ -52,8 +54,9 @@ export class Cockpit {
   private button?: HTMLButtonElement;
   private muteButton?: HTMLButtonElement;
   private strip?: HTMLElement;
-  private heardLine?: HTMLElement;
-  private sayingLine?: HTMLElement;
+  private feed?: HTMLElement;
+  private statusLabel?: HTMLElement;
+  private interimLine?: HTMLElement;
   private injectBox?: HTMLElement;
   private levelBar?: HTMLElement;
   private observer?: MutationObserver;
@@ -61,6 +64,7 @@ export class Cockpit {
   private composer?: HTMLElement;
   private mountParent?: HTMLElement;
   private injectTimer?: number;
+  private expanded = false;
   /** True while paint() writes, so the observer ignores what those writes queue. */
   private painting = false;
   private attachScheduled = false;
@@ -72,6 +76,7 @@ export class Cockpit {
     state: "idle",
     serverVoice: false,
     serverEars: false,
+    sttEngine: "hex",
     lang: "auto",
     noDir: false,
   };
@@ -191,19 +196,26 @@ export class Cockpit {
     strip.className = "ows-strip";
     strip.dataset.opencodeStream = "strip";
     strip.innerHTML = `
-      <div class="ows-strip-inner">
-        <div class="ows-meter"><span class="ows-meter-fill"></span></div>
-        <div class="ows-lines">
-          <p class="ows-heard" hidden></p>
-          <p class="ows-saying" hidden></p>
-          <div class="ows-inject" hidden></div>
+      <div class="ows-header">
+        <div class="ows-header-left">
+          <div class="ows-meter"><span class="ows-meter-fill"></span></div>
+          <span class="ows-status-dot"></span>
+          <span class="ows-status-label">Live</span>
         </div>
         <div class="ows-actions">
+          <button type="button" class="ows-chip ows-chip-stt" data-act="stt" title="Moteur STT : cliquer pour basculer Hex (local) ↔ Web (online)">stt:hex</button>
           <button type="button" class="ows-chip ows-chip-lang" data-act="lang" title="Langue écoutée : cliquer pour changer">auto</button>
           <button type="button" class="ows-chip" data-act="repeat" title="Répéter la dernière phrase">redire</button>
           <button type="button" class="ows-chip" data-act="digest" title="Lecture complète ou résumée">résumé</button>
           <button type="button" class="ows-chip ows-chip-stop" data-act="stop" title="Couper la voix">stop</button>
+          <button type="button" class="ows-chip" data-act="clear" title="Vider l'historique streamer">effacer</button>
+          <button type="button" class="ows-chip ows-chip-expand" data-act="expand" title="Agrandir / réduire l'historique">▴</button>
         </div>
+      </div>
+      <div class="ows-feed" hidden></div>
+      <div class="ows-live-footer">
+        <p class="ows-interim" hidden></p>
+        <div class="ows-inject" hidden></div>
       </div>`;
     strip.addEventListener("click", (event) => {
       const action = (event.target as HTMLElement).closest<HTMLElement>("[data-act]")?.dataset.act;
@@ -211,11 +223,15 @@ export class Cockpit {
       else if (action === "repeat") this.callbacks.onRepeat();
       else if (action === "digest") this.callbacks.onToggleDigest();
       else if (action === "lang") this.callbacks.onCycleLang();
+      else if (action === "stt") this.callbacks.onToggleSttMode();
+      else if (action === "clear") this.clearFeed();
+      else if (action === "expand") this.toggleExpanded();
     });
     document.body.appendChild(strip);
     this.strip = strip;
-    this.heardLine = strip.querySelector<HTMLElement>(".ows-heard")!;
-    this.sayingLine = strip.querySelector<HTMLElement>(".ows-saying")!;
+    this.feed = strip.querySelector<HTMLElement>(".ows-feed")!;
+    this.statusLabel = strip.querySelector<HTMLElement>(".ows-status-label")!;
+    this.interimLine = strip.querySelector<HTMLElement>(".ows-interim")!;
     this.injectBox = strip.querySelector<HTMLElement>(".ows-inject")!;
     this.levelBar = strip.querySelector<HTMLElement>(".ows-meter-fill")!;
   }
@@ -260,7 +276,38 @@ export class Cockpit {
       }
       this.composer?.classList.toggle("ows-composer-live", live);
       this.strip?.classList.toggle("is-visible", live);
+      this.strip?.classList.toggle("is-expanded", this.expanded);
       if (this.strip) setAttr(this.strip, "data-state", live ? state : "off");
+      if (this.statusLabel) {
+        const labels: Record<LiveState, string> = {
+          idle: "repos",
+          listening: "à l'écoute",
+          thinking: "réflexion",
+          speaking: "je parle",
+          interrupted: "interrompu",
+          waiting_user: "attente réponse",
+          away: "veille",
+        };
+        setText(this.statusLabel, live ? labels[state] : "éteint");
+      }
+      const sttChip = this.strip?.querySelector<HTMLElement>('[data-act="stt"]');
+      if (sttChip) {
+        const label = this.state.sttEngine === "hex" ? "stt:hex" : this.state.sttEngine === "server" ? "stt:srv" : "stt:web";
+        setText(sttChip, label);
+        sttChip.classList.toggle("is-on", this.state.serverEars);
+        setAttr(
+          sttChip,
+          "title",
+          this.state.serverEars
+            ? `STT local (${this.state.sttEngine}) — cliquer pour passer sur Edge Web Speech (online)`
+            : "STT navigateur (online) — cliquer pour passer sur Hex local (Orukeet)",
+        );
+      }
+      const expandChip = this.strip?.querySelector<HTMLElement>('[data-act="expand"]');
+      if (expandChip) {
+        setText(expandChip, this.expanded ? "▾" : "▴");
+        expandChip.classList.toggle("is-on", this.expanded);
+      }
       const digestChip = this.strip?.querySelector<HTMLElement>('[data-act="digest"]');
       digestChip?.classList.toggle("is-on", digest);
       const langChip = this.strip?.querySelector<HTMLElement>('[data-act="lang"]');
@@ -302,32 +349,65 @@ export class Cockpit {
   }
 
   setLevel(level: number) {
-    if (this.levelBar) this.levelBar.style.transform = `scaleX(${Math.max(0.02, Math.min(1, level)).toFixed(3)})`;
+    if (this.levelBar) this.levelBar.style.transform = `scaleY(${Math.max(0.08, Math.min(1, level)).toFixed(3)})`;
+  }
+
+  private appendEntry(kind: "heard" | "say" | "inject" | "note", html: string) {
+    if (!this.feed) return;
+    const nearBottom = this.feed.scrollHeight - this.feed.scrollTop - this.feed.clientHeight < 28;
+    const row = document.createElement("div");
+    row.className = `ows-entry ows-entry-${kind}`;
+    const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    row.innerHTML = `<span class="ows-time">${time}</span><div class="ows-entry-body">${html}</div>`;
+    this.painting = true;
+    try {
+      this.feed.hidden = false;
+      this.feed.appendChild(row);
+      while (this.feed.children.length > 60) this.feed.firstElementChild?.remove();
+      if (nearBottom) this.feed.scrollTop = this.feed.scrollHeight;
+    } finally {
+      queueMicrotask(() => {
+        this.painting = false;
+      });
+    }
+  }
+
+  private clearFeed() {
+    if (!this.feed) return;
+    this.painting = true;
+    try {
+      this.feed.innerHTML = "";
+      this.feed.hidden = true;
+    } finally {
+      queueMicrotask(() => {
+        this.painting = false;
+      });
+    }
+  }
+
+  private toggleExpanded() {
+    this.expanded = !this.expanded;
+    this.paint();
   }
 
   showHeard(raw: string, corrected: string, decision: string) {
-    if (!this.heardLine) return;
+    if (this.interimLine) this.interimLine.hidden = true;
     const changed = corrected && corrected.toLowerCase() !== raw.toLowerCase();
-    this.heardLine.hidden = false;
-    this.heardLine.innerHTML = changed
+    const body = changed
       ? `<span class="ows-tag">entendu</span> <span class="ows-raw">${escapeHtml(raw)}</span> <span class="ows-arrow">→</span> ${escapeHtml(corrected)} <span class="ows-decision">${escapeHtml(decision)}</span>`
       : `<span class="ows-tag">entendu</span> ${escapeHtml(raw)} <span class="ows-decision">${escapeHtml(decision)}</span>`;
+    this.appendEntry("heard", body);
   }
 
   showInterim(text: string) {
-    if (!this.heardLine) return;
-    this.heardLine.hidden = false;
-    this.heardLine.innerHTML = `<span class="ows-tag">…</span> <span class="ows-raw">${escapeHtml(text)}</span>`;
+    if (!this.interimLine) return;
+    this.interimLine.hidden = false;
+    this.interimLine.innerHTML = `<span class="ows-tag">…</span> <span class="ows-raw">${escapeHtml(text)}</span>`;
   }
 
   showSaying(text: string | undefined) {
-    if (!this.sayingLine) return;
-    if (!text) {
-      this.sayingLine.hidden = true;
-      return;
-    }
-    this.sayingLine.hidden = false;
-    this.sayingLine.innerHTML = `<span class="ows-tag ows-tag-say">je dis</span> ${escapeHtml(text)}`;
+    if (!text) return;
+    this.appendEntry("say", `<span class="ows-tag ows-tag-say">je dis</span> ${escapeHtml(text)}`);
   }
 
   /** Show an injection about to be sent, with a countdown and a way out. */
@@ -339,6 +419,7 @@ export class Cockpit {
       <span class="ows-tag ows-tag-inject">${label}</span>
       <span class="ows-inject-text">${escapeHtml(text)}</span>
       <button type="button" class="ows-chip ows-chip-cancel">annuler <span class="ows-count"></span></button>`;
+    this.appendEntry("inject", `<span class="ows-tag ows-tag-inject">${label}</span> ${escapeHtml(text)}`);
     const cancel = this.injectBox.querySelector<HTMLButtonElement>(".ows-chip-cancel")!;
     cancel.addEventListener("click", () => this.callbacks.onCancelInject(injectId));
     const count = cancel.querySelector<HTMLElement>(".ows-count")!;
@@ -358,14 +439,9 @@ export class Cockpit {
   hideInject(note?: string) {
     if (this.injectTimer) window.clearInterval(this.injectTimer);
     this.injectTimer = undefined;
+    if (note) this.appendEntry("note", `<span class="ows-tag ows-tag-inject">${escapeHtml(note)}</span>`);
+    else this.appendEntry("note", `<span class="ows-tag ows-tag-inject">envoyé ✓</span>`);
     if (!this.injectBox) return;
-    if (note) {
-      this.injectBox.innerHTML = `<span class="ows-tag ows-tag-inject">${escapeHtml(note)}</span>`;
-      window.setTimeout(() => {
-        if (this.injectBox) this.injectBox.hidden = true;
-      }, 2500);
-      return;
-    }
     this.injectBox.hidden = true;
   }
 
@@ -520,41 +596,56 @@ function injectStyle() {
     }
     .ows-strip.is-visible { transform: translateX(-50%) translateY(0); opacity: 1; pointer-events: auto; }
     .ows-strip.ows-strip-docked.is-visible { transform: translateY(0); }
-    .ows-strip-inner { display: flex; align-items: flex-start; gap: 10px; padding: 8px 12px; }
-    .ows-lines { display: grid; gap: 4px; min-width: 0; flex: 1 1 auto; }
-    .ows-lines p { margin: 0; overflow-wrap: anywhere; }
-    .ows-meter { width: 3px; align-self: stretch; min-height: 24px; border-radius: 2px; background: var(--v2-background-bg-layer-03, rgba(128,128,128,.16)); overflow: hidden; }
-    .ows-meter-fill { display: block; width: 100%; height: 100%; background: var(--v2-icon-icon-accent, #0ea5b7); transform-origin: bottom; transform: scaleX(.02); transition: transform .08s linear; }
+    .ows-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px;
+      border-bottom: 1px solid var(--v2-border-border-muted, rgba(128,128,128,.16)); }
+    .ows-header-left { display: flex; align-items: center; gap: 7px; min-width: 0; }
+    .ows-status-dot { width: 7px; height: 7px; border-radius: 999px; background: #0ea5b7; flex: 0 0 auto; }
+    .ows-strip[data-state="speaking"] .ows-status-dot { background: #7c3aed; }
+    .ows-strip[data-state="thinking"] .ows-status-dot { background: #d97706; }
+    .ows-strip[data-state="waiting_user"] .ows-status-dot { background: #dc2626; }
+    .ows-status-label { font-size: 11px; font-weight: 500; color: var(--v2-text-text-muted, inherit); white-space: nowrap; }
+    .ows-feed { max-height: 170px; overflow-y: auto; overscroll-behavior: contain; padding: 6px 10px; display: grid; gap: 5px;
+      scrollbar-width: thin; }
+    .ows-strip.is-expanded .ows-feed { max-height: 340px; }
+    .ows-feed[hidden] { display: none; }
+    .ows-entry { display: flex; align-items: baseline; gap: 7px; font-size: 12px; line-height: 1.42; }
+    .ows-time { font-family: var(--font-family-mono, ui-monospace, monospace); font-size: 10px; opacity: .5; flex: 0 0 auto; }
+    .ows-entry-body { min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
+    .ows-live-footer { display: grid; gap: 4px; padding: 0 10px; }
+    .ows-live-footer:has(> :not([hidden])) { padding: 6px 10px; border-top: 1px solid var(--v2-border-border-muted, rgba(128,128,128,.14)); }
+    .ows-interim { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
+    .ows-meter { width: 4px; height: 18px; border-radius: 2px; background: var(--v2-background-bg-layer-03, rgba(128,128,128,.16)); overflow: hidden; flex: 0 0 auto; }
+    .ows-meter-fill { display: block; width: 100%; height: 100%; background: var(--v2-icon-icon-accent, #0ea5b7); transform-origin: bottom; transform: scaleY(.08); transition: transform .08s linear; }
 
     .ows-tag { display: inline-block; font-size: 10px; font-weight: 500; letter-spacing: .06em; text-transform: uppercase;
       padding: 1px 6px; border-radius: 6px; margin-right: 6px; vertical-align: 1px;
       background: var(--v2-background-bg-layer-02, rgba(128,128,128,.14)); color: var(--v2-text-text-muted, inherit); }
-    .ows-tag-say { background: rgba(124,58,237,.16); color: #7c3aed; }
-    .ows-tag-inject { background: rgba(14,165,183,.16); color: #0e7490; }
+    .ows-tag-say { background: rgba(124,58,237,.16); color: #a78bfa; }
+    .ows-tag-inject { background: rgba(14,165,183,.16); color: #22d3ee; }
     .ows-raw { color: var(--v2-text-text-muted, inherit); opacity: .7; text-decoration: line-through dotted; }
     .ows-arrow { color: var(--v2-text-text-muted, inherit); opacity: .65; margin: 0 3px; }
-    .ows-decision { color: var(--v2-text-text-muted, inherit); opacity: .65; font-size: 11px; margin-left: 6px; }
-    .ows-saying { color: var(--v2-text-text-base, inherit); }
+    .ows-decision { color: var(--v2-text-text-muted, inherit); opacity: .72; font-size: 11px; margin-left: 6px; font-family: var(--font-family-mono, ui-monospace, monospace); }
     .ows-inject { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .ows-inject-text { font-weight: 500; }
 
-    .ows-actions { display: flex; gap: 4px; align-self: center; flex: 0 0 auto; }
-    .ows-chip { font: inherit; font-size: 11px; padding: 3px 8px; border-radius: 8px; cursor: pointer;
+    .ows-actions { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    .ows-chip { font: inherit; font-size: 11px; padding: 2px 7px; border-radius: 7px; cursor: pointer;
       background: var(--v2-background-bg-layer-02, transparent); color: var(--v2-text-text-muted, inherit);
       border: 1px solid var(--v2-border-border-muted, rgba(128,128,128,.22));
       transition: background .14s ease, color .14s ease, border-color .14s ease; }
     .ows-chip:hover { color: var(--v2-text-text-base, inherit); background: var(--v2-background-bg-layer-03, rgba(128,128,128,.12)); }
     .ows-chip.is-on { color: var(--v2-text-text-base, inherit); background: var(--v2-background-bg-layer-03, rgba(14,165,183,.14)); border-color: var(--v2-border-border-strong, rgba(14,165,183,.45)); }
     .ows-chip-stop:hover { border-color: rgba(220,38,38,.55); color: #dc2626; }
-    .ows-chip-lang { font-family: var(--font-family-mono, ui-monospace, monospace); letter-spacing: .04em; min-width: 3.2em; text-align: center; }
+    .ows-chip-lang, .ows-chip-stt { font-family: var(--font-family-mono, ui-monospace, monospace); letter-spacing: .03em; }
     .ows-chip-cancel { border-color: rgba(220,38,38,.45); }
 
     @media (pointer: coarse), (max-width: 640px) {
       .ows-strip { left: 8px; right: 8px; transform: translateY(140%); width: auto; max-width: none; }
       .ows-strip.ows-strip-docked { left: 8px; right: 8px; bottom: calc(100% + 6px); }
       .ows-strip.is-visible { transform: translateY(0); }
-      .ows-strip-inner { flex-wrap: wrap; gap: 8px; padding: 8px 10px; }
-      .ows-actions { flex-wrap: wrap; width: 100%; justify-content: flex-end; }
+      .ows-header { flex-wrap: wrap; gap: 6px; padding: 6px 8px; }
+      .ows-actions { width: 100%; justify-content: flex-end; }
+      .ows-feed { max-height: 140px; }
     }
     @media (prefers-reduced-motion: reduce) {
       .ows-strip { transition: opacity .2s ease; }

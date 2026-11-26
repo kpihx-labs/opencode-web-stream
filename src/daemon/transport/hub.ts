@@ -92,14 +92,17 @@ export class Hub implements Outbound {
    * Rebinding before sending means the notification and everything after it
    * reach the same cockpit.
    */
-  rebind(from: string, to: string, msg: ServerMessage) {
-    const moved = [...this.clients.values()].filter((c) => (c.sessionID ?? "") === from);
+  rebind(from: string, to: string, msg: ServerMessage, directory?: string) {
+    const moved = [...this.clients.values()].filter(
+      (c) => (c.sessionID ?? "") === from && (from !== "" || !directory || !c.directory || c.directory === directory),
+    );
     for (const c of moved) {
       c.sessionID = to;
+      if (directory) c.directory = directory;
       c.attachedAt = Date.now();
       this.send(c, msg);
     }
-    this.log.info("cockpits rebound", { from: from || "(new session)", to, count: moved.length });
+    this.log.info("cockpits rebound", { from: from || "(new session)", to, directory, count: moved.length });
   }
 
   speak(utterance: Utterance) {
@@ -241,6 +244,11 @@ export class Hub implements Outbound {
         case "cancel_inject":
           this.orchestrator.cancelInject(msg.sessionID, msg.injectId);
           return;
+        case "stt_mode":
+          this.deps.stt.setMode(msg.mode);
+          await this.deps.stt.check(true);
+          this.broadcastStatus();
+          return;
         case "ping":
           this.send(client, { type: "pong", t: msg.t });
           return;
@@ -363,7 +371,7 @@ export class Hub implements Outbound {
         const spokenOver = url.searchParams.get("spokenOver") ?? undefined;
         const mime = String(req.headers["content-type"] ?? "audio/wav").split(";")[0];
         const audio = await readBody(req, 25 * 1024 * 1024);
-        if (audio.length < 1000) {
+        if (audio.length < 250) {
           json(res, 400, { error: "audio too short" });
           return;
         }

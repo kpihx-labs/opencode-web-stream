@@ -69,7 +69,7 @@ async function harness(overrides = {}) {
     opencode: { ...DEFAULTS.opencode, url },
     decision: { ...DEFAULTS.decision, enabled: false },
     // No speech engines in tests: the cockpit would fall back to the browser.
-    stt: { ...DEFAULTS.stt, url: "" },
+    stt: { ...DEFAULTS.stt, mode: "browser", url: "" },
     tts: { ...DEFAULTS.tts, mode: "off", url: "" },
     streamer: { ...DEFAULTS.streamer, injectDelayMs: 20, blockedRepeatMs: 0, ...overrides.streamer },
     beats: { ...DEFAULTS.beats, windowMs: 60, ttlMs: 5000, ...overrides.beats },
