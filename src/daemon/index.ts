@@ -9,6 +9,7 @@ import { Orchestrator } from "./core/orchestrator.js";
 import { Hub } from "./transport/hub.js";
 import { TtsEngine } from "./engines/tts.js";
 import { SttEngine } from "./engines/stt.js";
+import { DecisionEngine } from "./engines/decision.js";
 
 /**
  * Daemon entry point. `startDaemon` is also used by the integration tests, so
@@ -40,8 +41,9 @@ export async function startDaemon(cfg: Config, opts: { fetch?: typeof fetch; log
   const registry = new Registry(cfg.dataDir);
   const tts = new TtsEngine(cfg.tts, logger.scope("tts"), opts.fetch);
   const stt = new SttEngine(cfg.stt, logger.scope("stt"), opts.fetch);
-  const hub = new Hub({ cfg, logger, tts, stt, version });
-  const orchestrator = new Orchestrator(cfg, client, registry, hub, logger);
+  const decision = new DecisionEngine(cfg.decision, logger.scope("decision"), opts.fetch);
+  const hub = new Hub({ cfg, logger, tts, stt, decision, version });
+  const orchestrator = new Orchestrator(cfg, client, registry, hub, logger, decision);
   hub.attach(orchestrator);
   orchestrator.restoreBindings();
 
@@ -57,8 +59,8 @@ export async function startDaemon(cfg: Config, opts: { fetch?: typeof fetch; log
     },
     onClose: (err) => orchestrator.setConnected(false, err?.message),
   });
-  void Promise.all([tts.check(true), stt.check(true)]).then(() => {
-    log.info("engines", { tts: tts.describe(), stt: stt.describe() });
+  void Promise.all([tts.check(true), stt.check(true), decision.check(true)]).then(() => {
+    log.info("engines", { tts: tts.describe(), stt: stt.describe(), decision: decision.describe() });
   });
 
   let stopped = false;

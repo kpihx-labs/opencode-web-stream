@@ -21,6 +21,13 @@ export type Config = {
     /** Directories whose sessions the daemon may narrate; empty = all. */
     directories: string[];
   };
+  decision: {
+    enabled: boolean;
+    /** Local OpenVINO or OpenAI-compatible small-model endpoint for <300ms triage. */
+    url: string;
+    model: string;
+    timeoutMs: number;
+  };
   streamer: {
     agent: string;
     model: string;
@@ -75,7 +82,9 @@ export type Config = {
     timeoutMs: number;
   };
   tts: {
-    /** OpenAI-compatible speech endpoint; empty disables server TTS. */
+    /** "auto" uses custom url if set else built-in Edge TTS; "off" forces browser voice. */
+    mode: "auto" | "edge" | "off";
+    /** OpenAI-compatible speech endpoint; empty uses built-in Edge TTS when mode !== "off". */
     url: string;
     model: string;
     /** Fallback voice when no per-language voice matches. */
@@ -102,14 +111,20 @@ export const DEFAULTS: Config = {
   dataDir: join(homedir(), ".local", "share", "opencode-web-stream"),
   logLevel: "info",
   opencode: {
-    url: "http://127.0.0.1:40977",
+    url: "http://127.0.0.1:49374",
     username: "opencode",
     password: "",
     directories: [],
   },
+  decision: {
+    enabled: true,
+    url: "http://127.0.0.1:11437/v1/chat/completions",
+    model: "qwen3-0.6b",
+    timeoutMs: 2500,
+  },
   streamer: {
     agent: "streamer",
-    model: "opencode-go/muse-spark-1.3-contributor",
+    model: "opencode-go/hy4-flash-free",
     beatTimeoutMs: 9000,
     voiceTimeoutMs: 20000,
     summarizeEveryPrompts: 80,
@@ -136,20 +151,21 @@ export const DEFAULTS: Config = {
     default: "fr",
   },
   stt: {
-    url: "http://127.0.0.1:8000/v1/audio/transcriptions",
-    model: "Systran/faster-whisper-large-v3",
+    url: "",
+    model: "",
     language: "auto",
     promptTerms: 60,
     timeoutMs: 20000,
   },
   tts: {
-    url: "http://127.0.0.1:8000/v1/audio/speech",
-    model: "speaches-ai/Kokoro-82M-v1.0-ONNX",
-    voice: "ff_siwis",
-    voices: { fr: "ff_siwis", en: "af_heart" },
-    format: "wav",
+    mode: "auto",
+    url: "",
+    model: "kokoro",
+    voice: "fr-FR-VivienneMultilingualNeural",
+    voices: { fr: "fr-FR-VivienneMultilingualNeural", en: "en-US-EmmaMultilingualNeural" },
+    format: "mp3",
     speed: 1.05,
-    timeoutMs: 15000,
+    timeoutMs: 12000,
   },
   lexicon: {
     maxFiles: 6000,
@@ -214,6 +230,27 @@ function applyEnv(cfg: Config, env: NodeJS.ProcessEnv) {
   cfg.speech.languages = cfg.speech.languages.map(shortLang);
   cfg.speech.default = shortLang(cfg.speech.default);
   cfg.opencode.url = cfg.opencode.url.replace(/\/+$/, "");
+  if (!cfg.opencode.password) {
+    cfg.opencode.password = readServicePassword(env);
+  }
+  if (env.OPENCODE_WEB_STREAM_DECISION_URL !== undefined) cfg.decision.url = env.OPENCODE_WEB_STREAM_DECISION_URL;
+  if (env.OPENCODE_WEB_STREAM_DECISION_MODEL) cfg.decision.model = env.OPENCODE_WEB_STREAM_DECISION_MODEL;
+  if (env.OPENCODE_WEB_STREAM_TTS_MODE) cfg.tts.mode = env.OPENCODE_WEB_STREAM_TTS_MODE as Config["tts"]["mode"];
+}
+
+function readServicePassword(env: NodeJS.ProcessEnv): string {
+  const xdgState = env.XDG_STATE_HOME || join(homedir(), ".local", "state");
+  const candidates = [env.OPENCODE_SERVICE_JSON, join(xdgState, "opencode", "service.json")].filter(Boolean) as string[];
+  for (const p of candidates) {
+    if (!existsSync(p)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(p, "utf8")) as { password?: unknown };
+      if (typeof parsed.password === "string" && parsed.password) return parsed.password;
+    } catch {
+      // ignore unreadable state file
+    }
+  }
+  return "";
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {

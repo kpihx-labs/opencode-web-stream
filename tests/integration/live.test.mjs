@@ -67,9 +67,10 @@ async function harness(overrides = {}) {
     dataDir,
     logLevel: "error",
     opencode: { ...DEFAULTS.opencode, url },
+    decision: { ...DEFAULTS.decision, enabled: false },
     // No speech engines in tests: the cockpit would fall back to the browser.
     stt: { ...DEFAULTS.stt, url: "" },
-    tts: { ...DEFAULTS.tts, url: "" },
+    tts: { ...DEFAULTS.tts, mode: "off", url: "" },
     streamer: { ...DEFAULTS.streamer, injectDelayMs: 20, blockedRepeatMs: 0, ...overrides.streamer },
     beats: { ...DEFAULTS.beats, windowMs: 60, ttlMs: 5000, ...overrides.beats },
     answer: { ...DEFAULTS.answer, ...overrides.answer },
@@ -242,7 +243,8 @@ test("voice becomes a cleaned injection, acknowledged out loud", async (t) => {
 
   const pending = h.cockpit.of("inject_pending").at(-1);
   assert.equal(pending.mode, "queue");
-  assert.ok(h.cockpit.of("inject_done").at(-1).ok);
+  const done = await until(() => h.cockpit.of("inject_done").at(-1), { label: "inject_done" });
+  assert.ok(done.ok);
 });
 
 test("interrupt mode aborts the session before injecting", async (t) => {

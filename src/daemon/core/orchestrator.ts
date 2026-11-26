@@ -17,6 +17,7 @@ import type { Logger, ScopedLogger } from "../log.js";
 import { buildLexicon, type Lexicon } from "../lexicon/build.js";
 import { candidatesFor, renderLexiconContext, topPhrases } from "../lexicon/match.js";
 import { OpencodeClient } from "../opencode/client.js";
+import type { DecisionEngine } from "../engines/decision.js";
 import { BeatWindow, excerpt, renderBeat, type Beat } from "./beats.js";
 import type { Registry } from "./registry.js";
 import { codeRatio, SentenceSplitter } from "./sentences.js";
@@ -109,6 +110,7 @@ export class Orchestrator {
     private readonly registry: Registry,
     private readonly out: Outbound,
     logger: Logger,
+    private readonly decision?: DecisionEngine,
   ) {
     this.log = logger.scope("orchestrator");
   }
@@ -759,6 +761,10 @@ export class Orchestrator {
   // ---- beats ---------------------------------------------------------------
 
   private onBeat(beat: Beat) {
+    void this.handleBeat(beat);
+  }
+
+  private async handleBeat(beat: Beat) {
     const s = this.sessions.get(beat.sessionID);
     if (!s || !s.live || !s.streamer) return;
     if (s.pending) return; // the user is being asked something; activity can wait
@@ -768,11 +774,14 @@ export class Orchestrator {
       todo: s.todo,
       elapsedSinceStartMs: s.userPromptAt ? Date.now() - s.userPromptAt : undefined,
     });
+    if (this.decision?.isReady && beat.tools.length <= 2) {
+      const worthSpeaking = await this.decision.triageBeat(prompt);
+      if (!worthSpeaking || !s.live || s.pending) return;
+    }
     const expiresAt = Date.now() + this.cfg.beats.ttlMs;
-    void this.askStreamer(s, "beat", prompt, this.cfg.streamer.beatTimeoutMs, "beat", expiresAt).then((res) => {
-      if (!res) return;
-      this.applyDecisions(s, res.decisions, { spoke: res.spoke, source: "beat", expiresAt });
-    });
+    const res = await this.askStreamer(s, "beat", prompt, this.cfg.streamer.beatTimeoutMs, "beat", expiresAt);
+    if (!res) return;
+    this.applyDecisions(s, res.decisions, { spoke: res.spoke, source: "beat", expiresAt });
   }
 
   // ---- blocked -------------------------------------------------------------
@@ -1041,6 +1050,26 @@ export class Orchestrator {
     s.streamer.dropBeats();
     this.setPhase(s, "thinking");
     this.setLanguage(s, opts.lang);
+    if (this.decision?.isReady && !s.pending && (opts.bargeIn || raw.length < 48)) {
+      const triage = await this.decision.triageVoice(raw, {
+        speaking: s.phase === "speaking" || s.phase === "interrupted" || opts.bargeIn,
+        busy: s.status === "busy",
+      });
+      if (triage === "noise" && raw.split(/\s+/).length <= 2) {
+        s.lastHeard = { raw, corrected: raw };
+        this.out.toSession(s.id, { type: "heard", sessionID: s.id, raw, corrected: raw, decision: "quiet(local)" });
+        if (opts.bargeIn) this.out.toSession(s.id, { type: "resume", sessionID: s.id });
+        this.setPhase(s, s.status === "busy" ? "thinking" : "listening");
+        return "quiet";
+      }
+      if (triage === "stop") {
+        s.lastHeard = { raw, corrected: raw };
+        this.out.toSession(s.id, { type: "heard", sessionID: s.id, raw, corrected: raw, decision: "control:stop(local)" });
+        this.applyControl(s, "stop");
+        this.setPhase(s, s.status === "busy" ? "thinking" : "listening");
+        return "control:stop";
+      }
+    }
     const lexicon = await this.lexiconFor(s.directory);
     const candidates = candidatesFor(raw, lexicon, this.registry.aliases(), { limit: this.cfg.lexicon.candidateTerms });
     const lines = ["[VOICE]", `transcript: ${raw}`];
@@ -1204,7 +1233,7 @@ export class Orchestrator {
         const given = answers[i] ?? answers[0] ?? [];
         return given.map((a) => q.options.find((o) => o.label.toLowerCase() === a.toLowerCase())?.label ?? a);
       });
-      await this.client.replyQuestion(s.directory, p.req.id, mapped);
+      await this.client.replyQuestion(s.directory, p.req.id, mapped, s.id);
       this.clearPending(s);
     } catch (e) {
       this.log.error("question reply failed", { error: e instanceof Error ? e.message : String(e) });

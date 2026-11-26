@@ -33,8 +33,9 @@ async function harness() {
     dataDir,
     logLevel: "error",
     opencode: { ...DEFAULTS.opencode, url },
+    decision: { ...DEFAULTS.decision, enabled: false },
     stt: { ...DEFAULTS.stt, url: "" },
-    tts: { ...DEFAULTS.tts, url: "" },
+    tts: { ...DEFAULTS.tts, mode: "off", url: "" },
     streamer: { ...DEFAULTS.streamer, injectDelayMs: 20, blockedRepeatMs: 0 },
     beats: { ...DEFAULTS.beats, windowMs: 60 },
   };

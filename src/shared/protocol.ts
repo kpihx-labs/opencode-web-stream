@@ -76,6 +76,7 @@ export type DaemonStatus = {
   opencode: { connected: boolean; url: string; lastError?: string };
   tts: { engine: "server" | "browser"; ready: boolean; voice?: string };
   stt: { engine: "browser" | "server"; ready: boolean };
+  decision?: { enabled: boolean; ready: boolean; model: string; url: string };
   /** Languages the daemon is configured for; the cockpit offers these plus "auto". */
   speech: { languages: string[]; default: string };
   sessions: SessionSnapshot[];

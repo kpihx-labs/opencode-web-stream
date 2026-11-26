@@ -67,6 +67,7 @@ async function harness() {
     dataDir,
     logLevel: "error",
     opencode: { ...DEFAULTS.opencode, url },
+    decision: { ...DEFAULTS.decision, enabled: false },
     stt: { ...DEFAULTS.stt, url: `${speech.url}/v1/audio/transcriptions`, language: "auto" },
     tts: { ...DEFAULTS.tts, url: `${speech.url}/v1/audio/speech`, voices: { fr: "ff_siwis", en: "af_heart" } },
     streamer: { ...DEFAULTS.streamer, injectDelayMs: 20, blockedRepeatMs: 0 },

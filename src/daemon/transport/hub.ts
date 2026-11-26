@@ -8,6 +8,7 @@ import type { Logger, ScopedLogger } from "../log.js";
 import type { Orchestrator, Outbound } from "../core/orchestrator.js";
 import type { SttEngine } from "../engines/stt.js";
 import type { TtsEngine } from "../engines/tts.js";
+import type { DecisionEngine } from "../engines/decision.js";
 
 /**
  * HTTP + WebSocket front door for the browser cockpit (through the Lens
@@ -30,6 +31,7 @@ export type HubDeps = {
   logger: Logger;
   tts: TtsEngine;
   stt: SttEngine;
+  decision?: DecisionEngine;
   version: string;
 };
 
@@ -267,12 +269,13 @@ export class Hub implements Outbound {
   }
 
   async status(): Promise<DaemonStatus> {
-    await Promise.all([this.deps.tts.check(), this.deps.stt.check()]);
+    await Promise.all([this.deps.tts.check(), this.deps.stt.check(), this.deps.decision?.check()]);
     return {
       protocol: PROTOCOL_VERSION,
       opencode: this.orchestrator.connection,
       tts: this.deps.tts.describe(),
       stt: this.deps.stt.describe(),
+      decision: this.deps.decision?.describe(),
       speech: { languages: this.deps.cfg.speech.languages, default: this.deps.cfg.speech.default },
       sessions: this.orchestrator.snapshots(),
     };
@@ -286,6 +289,7 @@ export class Hub implements Outbound {
     if (path.startsWith("/__stream__")) path = path.slice("/__stream__".length) || "/";
     res.setHeader("access-control-allow-origin", "*");
     res.setHeader("access-control-allow-headers", "content-type, x-session, x-lang, x-mime");
+    res.setHeader("access-control-expose-headers", "x-tts-boundaries");
     res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
     if (req.method === "OPTIONS") {
       res.writeHead(204).end();
@@ -333,7 +337,16 @@ export class Hub implements Outbound {
         }
         try {
           const out = await this.deps.tts.synthesize(body.text, { voice: body.voice, lang: body.lang, speed: body.speed });
-          res.writeHead(200, { "content-type": out.contentType, "content-length": out.bytes.length, "cache-control": "no-store" });
+          const headers: Record<string, string | number> = {
+            "content-type": out.contentType,
+            "content-length": out.bytes.length,
+            "cache-control": "no-store",
+          };
+          if (out.boundaries?.length) {
+            const encoded = Buffer.from(JSON.stringify(out.boundaries), "utf8").toString("base64");
+            if (encoded.length <= 16384) headers["x-tts-boundaries"] = encoded;
+          }
+          res.writeHead(200, headers);
           res.end(out.bytes);
         } catch (e) {
           json(res, 502, { error: e instanceof Error ? e.message : String(e) });

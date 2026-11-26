@@ -196,8 +196,11 @@ export async function postAudio(
   return (await res.json()) as { text: string; decision?: string };
 }
 
+export type TtsBoundary = { offsetMs: number; durationMs: number; text: string };
+export type TtsPayload = { blob: Blob; boundaries?: TtsBoundary[] };
+
 /** Fetch synthesized audio for one utterance, in the voice of its language. */
-export async function postTts(text: string, lang?: string, signal?: AbortSignal): Promise<Blob> {
+export async function postTts(text: string, lang?: string, signal?: AbortSignal): Promise<TtsPayload> {
   const res = await fetch(DaemonLink.apiUrl("/api/tts"), {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -205,5 +208,17 @@ export async function postTts(text: string, lang?: string, signal?: AbortSignal)
     signal,
   });
   if (!res.ok) throw new Error(`tts HTTP ${res.status}`);
-  return await res.blob();
+  const blob = await res.blob();
+  const rawMeta = res.headers.get("x-tts-boundaries");
+  let boundaries: TtsBoundary[] | undefined;
+  if (rawMeta) {
+    try {
+      const json = new TextDecoder().decode(Uint8Array.from(atob(rawMeta), (c) => c.charCodeAt(0)));
+      const parsed = JSON.parse(json);
+      if (Array.isArray(parsed)) boundaries = parsed as TtsBoundary[];
+    } catch {
+      // ignore malformed boundary metadata
+    }
+  }
+  return { blob, boundaries };
 }

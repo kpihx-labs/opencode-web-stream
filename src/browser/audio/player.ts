@@ -1,6 +1,6 @@
 import { SPEECH_PRIORITY, type Utterance } from "../../shared/protocol.js";
 import { log } from "../log.js";
-import { postTts } from "../net.js";
+import { postTts, type TtsBoundary, type TtsPayload } from "../net.js";
 
 /**
  * The voice.
@@ -31,7 +31,7 @@ type QueueItem = {
   utterance: Utterance;
   enqueuedAt: number;
   /** Prefetched audio, when synthesis ran ahead of playback. */
-  audio?: Promise<Blob | undefined>;
+  audio?: Promise<TtsPayload | undefined>;
 };
 
 export type PlayerOptions = {
@@ -137,10 +137,10 @@ export class VoicePlayer {
     });
   }
 
-  /** Synthesize the next couple of items while the current one plays. */
+  /** Synthesize the next few items while the current one plays. */
   private prefetch() {
     if (!this.opts.serverAvailable()) return;
-    for (const item of this.queue.slice(0, 2)) {
+    for (const item of this.queue.slice(0, 3)) {
       if (item.audio) continue;
       item.audio = postTts(item.utterance.text, item.utterance.lang)
         .catch((err) => {
@@ -187,15 +187,17 @@ export class VoicePlayer {
   }
 
   private async play(item: QueueItem): Promise<void> {
-    const blob = this.opts.serverAvailable() ? await (item.audio ?? postTts(item.utterance.text, item.utterance.lang).catch(() => undefined)) : undefined;
-    if (blob && this.context) {
-      await this.playBuffer(item, blob);
+    const payload = this.opts.serverAvailable()
+      ? await (item.audio ?? postTts(item.utterance.text, item.utterance.lang).catch(() => undefined))
+      : undefined;
+    if (payload?.blob && this.context) {
+      await this.playBuffer(item, payload.blob, payload.boundaries);
       return;
     }
     await this.playSpeechSynthesis(item);
   }
 
-  private async playBuffer(item: QueueItem, blob: Blob): Promise<void> {
+  private async playBuffer(item: QueueItem, blob: Blob, boundaries?: TtsBoundary[]): Promise<void> {
     const context = this.context!;
     let buffer: AudioBuffer;
     try {
@@ -206,6 +208,7 @@ export class VoicePlayer {
       return;
     }
     if (context.state === "suspended") await context.resume().catch(() => undefined);
+    if (this.gain) this.gain.gain.setValueAtTime(1, context.currentTime);
     await new Promise<void>((resolve) => {
       const source = context.createBufferSource();
       source.buffer = buffer;
@@ -216,10 +219,11 @@ export class VoicePlayer {
       const finish = (completed: boolean) => {
         if (settled) return;
         settled = true;
-        const elapsed = Math.max(0, context.currentTime - startedAt);
-        const fraction = buffer.duration > 0 ? Math.min(1, elapsed / buffer.duration) : 1;
+        const elapsedSec = Math.max(0, context.currentTime - startedAt);
+        const fraction = buffer.duration > 0 ? Math.min(1, (elapsedSec * this.rate) / buffer.duration) : 1;
+        const exactHeard = !completed && boundaries?.length ? heardFromBoundaries(boundaries, elapsedSec * 1000 * this.rate) : undefined;
         this.current = undefined;
-        this.finishItem(item, completed, fraction);
+        this.finishItem(item, completed, fraction, exactHeard);
         resolve();
       };
       source.onended = () => finish(true);
@@ -227,8 +231,11 @@ export class VoicePlayer {
         item,
         startedAt: Date.now(),
         stop: (completed) => {
+          // Instant playout drain: silence gain before stopping source so cut-off is <5ms.
           try {
+            if (!completed && this.gain) this.gain.gain.setValueAtTime(0, context.currentTime);
             source.stop();
+            source.disconnect();
           } catch {
             // already stopped
           }
@@ -315,8 +322,8 @@ export class VoicePlayer {
     });
   }
 
-  private finishItem(item: QueueItem, completed: boolean, fraction: number) {
-    const heardText = completed ? item.utterance.text : approximateHeard(item.utterance.text, fraction);
+  private finishItem(item: QueueItem, completed: boolean, fraction: number, exactHeard?: string) {
+    const heardText = completed ? item.utterance.text : exactHeard ?? approximateHeard(item.utterance.text, fraction);
     if (completed) this.lastCompleted = { utterance: item.utterance, text: item.utterance.text };
     this.events.onEnd(item.utterance, completed, heardText);
   }
@@ -391,6 +398,17 @@ export function chunkForSynthesis(text: string, limit = 180): string[] {
   }
   if (rest) out.push(rest);
   return out;
+}
+
+/** Exact words heard according to TTS WordBoundary timings up to `elapsedMs`. */
+export function heardFromBoundaries(boundaries: TtsBoundary[], elapsedMs: number): string {
+  if (elapsedMs <= 0) return "";
+  const spoken: string[] = [];
+  for (const b of boundaries) {
+    if (b.offsetMs <= elapsedMs) spoken.push(b.text);
+    else break;
+  }
+  return spoken.join(" ").trim();
 }
 
 /** What the listener heard before the cut, to the nearest word. */

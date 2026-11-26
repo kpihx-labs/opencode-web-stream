@@ -46,19 +46,52 @@ export type MicOptions = {
   minUtteranceMs?: number;
   /** Hard cap so a stuck detector cannot record forever. */
   maxUtteranceMs?: number;
-  /** Margin in decibels above the estimated noise floor. */
+  /** Margin in decibels above the estimated noise floor to start speech. */
   marginDb?: number;
+  /** Lower margin while speech is already active (hysteresis hold). */
+  holdMarginDb?: number;
   /** Extra margin while the agent is speaking, so only real speech cuts in. */
   duckedMarginDb?: number;
+  /** Lower margin while speech is active during agent playback. */
+  duckedHoldMarginDb?: number;
 };
 
 const FRAME_MS = 32;
 const FLOOR_WINDOW = 120; // ~4 s of frames
+const WORKLET_CODE = `
+class OwsVadMeter extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._acc = 0;
+    this._n = 0;
+    this._target = Math.max(128, Math.round((sampleRate || 48000) * 0.032));
+  }
+  process(inputs) {
+    const ch = inputs[0]?.[0];
+    if (ch) {
+      for (let i = 0; i < ch.length; i++) {
+        this._acc += ch[i] * ch[i];
+      }
+      this._n += ch.length;
+      if (this._n >= this._target) {
+        const rms = Math.sqrt(this._acc / this._n);
+        this.port.postMessage(rms);
+        this._acc = 0;
+        this._n = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("ows-vad-meter", OwsVadMeter);
+`;
 
 export class Microphone {
   private stream?: MediaStream;
   private context?: AudioContext;
   private analyser?: AnalyserNode;
+  private worklet?: AudioWorkletNode;
+  private workletUrl?: string;
   private source?: MediaStreamAudioSourceNode;
   private loopback?: { local: RTCPeerConnection; remote: RTCPeerConnection };
   private recorder?: MediaRecorder;
@@ -87,7 +120,9 @@ export class Microphone {
       minUtteranceMs: opts.minUtteranceMs ?? 450,
       maxUtteranceMs: opts.maxUtteranceMs ?? 30000,
       marginDb: opts.marginDb ?? 9,
+      holdMarginDb: opts.holdMarginDb ?? 5,
       duckedMarginDb: opts.duckedMarginDb ?? 16,
+      duckedHoldMarginDb: opts.duckedHoldMarginDb ?? 10,
     };
     this.referenceStream = opts.referenceStream;
   }
@@ -124,15 +159,18 @@ export class Microphone {
       this.context = new Ctor();
       if (this.context.state === "suspended") await this.context.resume().catch(() => undefined);
       this.source = this.context.createMediaStreamSource(this.stream);
-      this.analyser = this.context.createAnalyser();
-      this.analyser.fftSize = 1024;
-      this.analyser.smoothingTimeConstant = 0.2;
-      this.source.connect(this.analyser);
-      this.buffer = new Float32Array(new ArrayBuffer(this.analyser.fftSize * Float32Array.BYTES_PER_ELEMENT));
       this.startRecorder();
       this.running = true;
-      this.timer = window.setInterval(() => this.tick(), FRAME_MS);
-      log.info("microphone started");
+      const startedWorklet = await this.startWorklet();
+      if (!startedWorklet) {
+        this.analyser = this.context.createAnalyser();
+        this.analyser.fftSize = 1024;
+        this.analyser.smoothingTimeConstant = 0.2;
+        this.source.connect(this.analyser);
+        this.buffer = new Float32Array(new ArrayBuffer(this.analyser.fftSize * Float32Array.BYTES_PER_ELEMENT));
+        this.timer = window.setInterval(() => this.tick(), FRAME_MS);
+      }
+      log.info("microphone started", { worklet: startedWorklet });
     } catch (err) {
       log.error("microphone start failed", err);
       this.events.onError(err);
@@ -200,19 +238,56 @@ export class Microphone {
     }
   }
 
+  private async startWorklet(): Promise<boolean> {
+    if (!this.context?.audioWorklet || !this.source || typeof AudioWorkletNode === "undefined") return false;
+    try {
+      const blob = new Blob([WORKLET_CODE], { type: "application/javascript" });
+      this.workletUrl = URL.createObjectURL(blob);
+      await this.context.audioWorklet.addModule(this.workletUrl);
+      if (!this.running || !this.context || !this.source) return false;
+      this.worklet = new AudioWorkletNode(this.context, "ows-vad-meter");
+      this.worklet.port.onmessage = (event) => {
+        if (typeof event.data === "number") this.processRms(event.data);
+      };
+      this.source.connect(this.worklet);
+      return true;
+    } catch (err) {
+      log.debug("AudioWorklet unavailable, using AnalyserNode", err);
+      this.cleanupWorklet();
+      return false;
+    }
+  }
+
+  private cleanupWorklet() {
+    if (this.worklet) {
+      this.worklet.port.onmessage = null;
+      this.worklet.disconnect();
+      this.worklet = undefined;
+    }
+    if (this.workletUrl) {
+      URL.revokeObjectURL(this.workletUrl);
+      this.workletUrl = undefined;
+    }
+  }
+
   private tick() {
     if (!this.analyser || !this.buffer) return;
     this.analyser.getFloatTimeDomainData(this.buffer);
     let sum = 0;
     for (let i = 0; i < this.buffer.length; i++) sum += this.buffer[i] * this.buffer[i];
-    const rms = Math.sqrt(sum / this.buffer.length);
+    this.processRms(Math.sqrt(sum / this.buffer.length));
+  }
+
+  private processRms(rms: number) {
     const db = 20 * Math.log10(Math.max(rms, 1e-8));
     this.events.onLevel(Math.min(1, Math.max(0, (db + 60) / 60)));
 
     this.energies.push(db);
     if (this.energies.length > FLOOR_WINDOW) this.energies.shift();
     const floor = noiseFloor(this.energies);
-    const margin = this.ducked ? this.opts.duckedMarginDb : this.opts.marginDb;
+    const margin = this.speaking
+      ? (this.ducked ? this.opts.duckedHoldMarginDb : this.opts.holdMarginDb)
+      : (this.ducked ? this.opts.duckedMarginDb : this.opts.marginDb);
     const isVoice = db > floor + margin;
     const now = Date.now();
 
@@ -289,6 +364,7 @@ export class Microphone {
     this.energies.length = 0;
     this.speaking = false;
     this.confirmed = false;
+    this.cleanupWorklet();
     this.source?.disconnect();
     this.source = undefined;
     this.analyser = undefined;

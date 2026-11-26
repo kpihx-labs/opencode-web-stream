@@ -1,13 +1,16 @@
 import type { Config } from "../config.js";
 import type { ScopedLogger } from "../log.js";
+import { synthesizeEdgeTts, type WordBoundary } from "./edge-tts.js";
 
 /**
- * Speech synthesis through an OpenAI-compatible `/v1/audio/speech` endpoint
- * (speaches, Kokoro-FastAPI, openedai-speech, ...). The daemon only proxies:
- * the browser asks for one sentence at a time and plays the bytes.
+ * Speech synthesis supporting:
+ *   1. Explicit OpenAI-compatible `/v1/audio/speech` endpoint (when `cfg.tts.url` is set),
+ *   2. Built-in Microsoft Edge Read Aloud WebSocket streaming (`edge-tts` protocol)
+ *      with exact `WordBoundary` timings for accurate barge-in recovery,
+ *   3. Automatic fallback to browser `speechSynthesis` if offline.
  */
 
-export type TtsResult = { bytes: Buffer; contentType: string };
+export type TtsResult = { bytes: Buffer; contentType: string; boundaries?: WordBoundary[] };
 
 export class TtsEngine {
   private ready = false;
@@ -20,8 +23,16 @@ export class TtsEngine {
     private readonly fetchImpl: typeof fetch = fetch,
   ) {}
 
-  get enabled(): boolean {
+  get hasCustomEndpoint(): boolean {
     return Boolean(this.cfg.url);
+  }
+
+  get usesBuiltInEdge(): boolean {
+    return !this.hasCustomEndpoint && this.cfg.mode !== "off";
+  }
+
+  get enabled(): boolean {
+    return this.hasCustomEndpoint || this.usesBuiltInEdge;
   }
 
   get isReady(): boolean {
@@ -29,7 +40,11 @@ export class TtsEngine {
   }
 
   describe() {
-    return { engine: this.isReady ? ("server" as const) : ("browser" as const), ready: this.isReady, voice: this.cfg.voice };
+    return {
+      engine: this.isReady ? ("server" as const) : ("browser" as const),
+      ready: this.isReady,
+      voice: this.cfg.voice,
+    };
   }
 
   /** The configured voice for a language, else the fallback voice. */
@@ -41,6 +56,10 @@ export class TtsEngine {
   /** Probe the endpoint's server; cached for 30 s. */
   async check(force = false): Promise<boolean> {
     if (!this.enabled) return false;
+    if (this.usesBuiltInEdge) {
+      this.ready = true;
+      return true;
+    }
     const now = Date.now();
     if (!force && now - this.lastCheck < 30000) return this.ready;
     if (this.checking) return this.checking;
@@ -68,14 +87,37 @@ export class TtsEngine {
     return this.checking;
   }
 
-  async synthesize(text: string, opts: { voice?: string; lang?: string; speed?: number; signal?: AbortSignal } = {}): Promise<TtsResult> {
+  async synthesize(
+    text: string,
+    opts: { voice?: string; lang?: string; speed?: number; signal?: AbortSignal } = {},
+  ): Promise<TtsResult> {
     if (!this.enabled) throw new Error("server tts disabled");
+    const voice = opts.voice ?? this.voiceFor(opts.lang);
+    const speed = opts.speed ?? this.cfg.speed;
+
+    if (this.usesBuiltInEdge) {
+      try {
+        const out = await synthesizeEdgeTts(text, {
+          voice,
+          lang: opts.lang,
+          speed,
+          timeoutMs: this.cfg.timeoutMs,
+          signal: opts.signal,
+        });
+        this.ready = true;
+        return out;
+      } catch (e) {
+        this.ready = false;
+        throw e;
+      }
+    }
+
     const body = {
       model: this.cfg.model,
       input: text,
-      voice: opts.voice ?? this.voiceFor(opts.lang),
+      voice,
       response_format: this.cfg.format,
-      speed: opts.speed ?? this.cfg.speed,
+      speed,
     };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("tts timeout")), this.cfg.timeoutMs);
@@ -119,7 +161,7 @@ export function mimeFor(format: string): string {
     case "mp3":
       return "audio/mpeg";
     case "opus":
-      return "audio/ogg";
+      return "audio/opus";
     case "flac":
       return "audio/flac";
     case "pcm":

@@ -29,6 +29,7 @@ const LANG_KEY = "opencodeWebStream.lang";
  * language selector. Honouring it means one switch for both plugins.
  */
 const VOICE_PLUGIN_LANG_KEY = "opencodeWebVoiceLang";
+const V2_VOICE_LANG_KEY = "kpihx-voice-lang";
 const VOICE_PLUGIN_SELECT = "select.opencode-web-voice-plugin-lang-select";
 const LIVE_KEY = "opencodeWebStream.live";
 const MUTE_KEY = "opencodeWebStream.muted";
@@ -121,7 +122,7 @@ class CockpitApp {
   async start() {
     primeVoices();
     this.sessionID = sessionIdFromLocation();
-    this.directory = directoryFromLocation() || directoryFromDraft();
+    this.directory = resolveWorkspaceDirectory(this.sessionID);
     this.ui.mount();
     this.ui.update({ muted: this.muted, state: "idle", lang: this.lang });
     this.refreshDirState();
@@ -129,9 +130,11 @@ class CockpitApp {
     void this.refreshStatus();
     this.watchVoicePluginSelector();
     window.addEventListener("storage", (event) => {
-      if (event.key === VOICE_PLUGIN_LANG_KEY || event.key === LANG_KEY) this.setLanguage(resolveLanguagePreference(), false);
+      if (event.key === VOICE_PLUGIN_LANG_KEY || event.key === V2_VOICE_LANG_KEY || event.key === LANG_KEY) {
+        this.setLanguage(resolveLanguagePreference(), false);
+      }
       // The user picked another project in the new-session UI: re-resolve.
-      if (event.key === TABS_KEY) this.syncSession();
+      if (event.key === TABS_KEY || event.key === TABS_INFO_KEY) this.syncSession();
     });
 
     // Audio needs a gesture; take the first one the page gets.
@@ -160,7 +163,7 @@ class CockpitApp {
 
   private syncSession() {
     const next = sessionIdFromLocation();
-    const nextDirectory = directoryFromLocation() || directoryFromDraft();
+    const nextDirectory = resolveWorkspaceDirectory(next);
     if (nextDirectory && nextDirectory !== this.directory) {
       const hadNoDir = !this.directory;
       this.directory = nextDirectory;
@@ -244,6 +247,7 @@ class CockpitApp {
     if (persist) {
       writeString(LANG_KEY, next);
       writeString(VOICE_PLUGIN_LANG_KEY, next);
+      if (next !== "auto") writeString(V2_VOICE_LANG_KEY, next);
       // Keep the shared selector in step so the voice plugin follows too.
       const select = document.querySelector<HTMLSelectElement>(VOICE_PLUGIN_SELECT);
       if (select && select.value !== next && [...select.options].some((o) => o.value === next)) {
@@ -557,16 +561,17 @@ class CockpitApp {
    * looking at a page that no longer matches the conversation.
    */
   private followNavigation(sessionID: string, directory: string, url: string) {
-    log.info("following the new session", { sessionID, url });
+    const targetUrl = resolveSessionTargetUrl(sessionID, url);
+    log.info("following the new session", { sessionID, url: targetUrl });
     this.sessionID = sessionID;
     if (directory) this.directory = directory;
     if (sessionIdFromLocation() === sessionID) return;
     try {
-      history.pushState({}, "", url);
+      history.pushState({}, "", targetUrl);
       window.dispatchEvent(new PopStateEvent("popstate", { state: history.state }));
     } catch (err) {
       log.warn("pushState refused, loading the address", err);
-      location.assign(url);
+      location.assign(targetUrl);
       return;
     }
     // A router that ignored the event leaves the old view in place; the URL is
@@ -575,7 +580,7 @@ class CockpitApp {
       if (this.destroyed) return;
       if (sessionIdFromLocation() !== sessionID) {
         log.warn("the app did not follow, loading the address");
-        location.assign(url);
+        location.assign(targetUrl);
       }
     }, 900);
   }
@@ -609,6 +614,77 @@ export function directoryFromLocation(pathname = location.pathname): string {
 }
 
 const TABS_KEY = "opencode.window.browser.dat:tabs";
+const TABS_INFO_KEY = "opencode.window.browser.dat:tabs.info";
+const TABS_RECENT_KEY = "opencode.window.browser.dat:tabs.recent";
+
+function resolveWorkspaceDirectory(sessionID: string): string {
+  return directoryFromLocation() || directoryFromDraft() || directoryFromV2Tabs(sessionID);
+}
+
+/**
+ * OpenCode V2 tracks open sessions and drafts in `tabs.info` keyed by
+ * `${origin}\n${pathname}` and `tabs.recent`.
+ */
+export function directoryFromV2Tabs(
+  sessionID = sessionIdFromLocation(),
+  pathname = location.pathname,
+  origin = location.origin,
+): string {
+  try {
+    const rawInfo = localStorage.getItem(TABS_INFO_KEY);
+    if (rawInfo) {
+      const info = JSON.parse(rawInfo) as Record<string, { directory?: unknown }>;
+      const exact = info?.[`${origin}\n${pathname}`];
+      if (typeof exact?.directory === "string" && exact.directory.startsWith("/")) return exact.directory;
+      if (sessionID) {
+        const suffix = `/session/${encodeURIComponent(sessionID)}`;
+        for (const [key, entry] of Object.entries(info ?? {})) {
+          if (key.endsWith(suffix) && typeof entry?.directory === "string" && entry.directory.startsWith("/")) {
+            return entry.directory;
+          }
+        }
+      }
+      const rawRecent = localStorage.getItem(TABS_RECENT_KEY);
+      if (rawRecent) {
+        const recent = JSON.parse(rawRecent) as { key?: unknown };
+        if (typeof recent?.key === "string") {
+          const entry = info?.[recent.key];
+          if (typeof entry?.directory === "string" && entry.directory.startsWith("/")) return entry.directory;
+        }
+      }
+    }
+    const rawTabs = localStorage.getItem(TABS_KEY);
+    if (rawTabs) {
+      const tabs = JSON.parse(rawTabs) as Array<{ type?: unknown; directory?: unknown }>;
+      if (Array.isArray(tabs)) {
+        for (let i = tabs.length - 1; i >= 0; i--) {
+          const d = tabs[i]?.directory;
+          if (typeof d === "string" && d.startsWith("/")) return d;
+        }
+      }
+    }
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+export function resolveSessionTargetUrl(sessionID: string, fallbackUrl: string): string {
+  const serverMatch = location.pathname.match(/^(\/server\/[^/]+)/);
+  if (serverMatch) return `${serverMatch[1]}/session/${encodeURIComponent(sessionID)}`;
+  try {
+    if (localStorage.getItem(TABS_KEY) !== null || localStorage.getItem(TABS_INFO_KEY) !== null) {
+      const bytes = new TextEncoder().encode(location.origin);
+      let bin = "";
+      for (const b of bytes) bin += String.fromCharCode(b);
+      const slug = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      return `/server/${slug}/session/${encodeURIComponent(sessionID)}`;
+    }
+  } catch {
+    // ignore storage access issues
+  }
+  return fallbackUrl;
+}
 
 /**
  * The folder the new-session page is about to work in. OpenCode Web keeps it
@@ -645,8 +721,8 @@ function decodeBase64(value: string): string {
     const binary = atob(padded);
     const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
     const decoded = new TextDecoder().decode(bytes);
-    // A real path, not a route segment that merely looked like base64.
-    return decoded.startsWith("/") || decoded.includes("/") ? decoded : "";
+    // A real filesystem path, not an HTTP origin or route segment.
+    return decoded.startsWith("/") ? decoded : "";
   } catch {
     return "";
   }
@@ -695,6 +771,8 @@ export function resolveLanguagePreference(): string {
   if (select?.value) return select.value;
   const shared = readString(VOICE_PLUGIN_LANG_KEY, "");
   if (shared) return shared;
+  const v2Voice = readString(V2_VOICE_LANG_KEY, "");
+  if (v2Voice) return v2Voice;
   const own = readString(LANG_KEY, "");
   if (own) return own;
   return "auto";

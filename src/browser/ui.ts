@@ -37,12 +37,16 @@ export type UiState = {
 
 const STYLE_ID = "opencode-web-stream-style";
 const COMPOSER_SELECTORS = [
+  'form[data-component="composer"]',
   '[data-component="prompt-input-v2"]',
   '[data-component="session-composer"]',
   '[data-component="session-new-composer"]',
   '[data-component="session-prompt-dock"]',
   '[data-component="prompt-input"]',
 ].join(", ");
+
+const SPEAKER_ON_SVG = `<svg data-slot="icon-svg" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2.5 6.2H5.2L8.7 3.2V12.8L5.2 9.8H2.5V6.2Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M11 5.6C11.75 6.3 12.15 7.15 12.15 8C12.15 8.85 11.75 9.7 11 10.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M12.9 3.9C14.1 5.05 14.7 6.45 14.7 8C14.7 9.55 14.1 10.95 12.9 12.1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`;
+const SPEAKER_OFF_SVG = `<svg data-slot="icon-svg" width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2.5 6.2H5.2L8.7 3.2V12.8L5.2 9.8H2.5V6.2Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M11.2 5.8L14.4 10.2M14.4 5.8L11.2 10.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`;
 
 export class Cockpit {
   private button?: HTMLButtonElement;
@@ -112,6 +116,7 @@ export class Cockpit {
       return;
     }
     const actions =
+      composer.querySelector<HTMLElement>('[data-slot="composer-actions"]') ??
       composer.querySelector<HTMLElement>('[data-action="prompt-attach"]')?.parentElement ??
       composer.querySelector<HTMLElement>('[data-component="prompt-agent-control"]')?.parentElement ??
       composer;
@@ -119,6 +124,9 @@ export class Cockpit {
     const button = document.createElement("button");
     button.type = "button";
     button.dataset.opencodeStream = "live";
+    button.setAttribute("data-component", "icon-button-v2");
+    button.setAttribute("data-size", "normal");
+    button.setAttribute("data-variant", "ghost-muted");
     button.className = "ows-button";
     button.innerHTML = `<span class="ows-sr">Mode live</span><span class="ows-waves">${"<i></i>".repeat(4)}</span>`;
     button.addEventListener("click", (event) => {
@@ -129,16 +137,41 @@ export class Cockpit {
     const mute = document.createElement("button");
     mute.type = "button";
     mute.dataset.opencodeStream = "mute";
+    mute.setAttribute("data-component", "icon-button-v2");
+    mute.setAttribute("data-size", "normal");
+    mute.setAttribute("data-variant", "ghost-muted");
     mute.className = "ows-mute";
+    mute.innerHTML = SPEAKER_ON_SVG;
     mute.addEventListener("click", (event) => {
       event.preventDefault();
       this.callbacks.onToggleMute();
     });
 
-    actions.append(button, mute);
+    const submit = actions.querySelector('[data-action="composer-submit"]');
+    if (submit) {
+      actions.insertBefore(button, submit);
+      actions.insertBefore(mute, submit);
+    } else {
+      actions.append(button, mute);
+    }
+    this.mountStripNear(composer);
     this.button = button;
     this.muteButton = mute;
     this.paint();
+  }
+
+  private mountStripNear(composer: HTMLElement) {
+    this.ensureStrip();
+    if (!this.strip) return;
+    const dock = composer.closest<HTMLElement>('[data-slot="composer-morph"], [data-component="session-composer-dock"]');
+    if (dock) {
+      if (getComputedStyle(dock).position === "static") dock.style.position = "relative";
+      this.strip.classList.add("ows-strip-docked");
+      if (this.strip.parentElement !== dock) dock.appendChild(this.strip);
+    } else {
+      this.strip.classList.remove("ows-strip-docked");
+      if (this.strip.parentElement !== document.body) document.body.appendChild(this.strip);
+    }
   }
 
   private ensureStrip() {
@@ -204,9 +237,15 @@ export class Cockpit {
       if (this.muteButton) {
         const title = muted ? "Narration coupée" : "Narration active";
         this.muteButton.classList.toggle("is-muted", muted);
+        this.muteButton.hidden = !live;
         setAttr(this.muteButton, "title", title);
         setAttr(this.muteButton, "aria-label", title);
-        setText(this.muteButton, muted ? "🔇" : "🔊");
+        setAttr(this.muteButton, "aria-pressed", String(muted));
+        const nextHtml = muted ? SPEAKER_OFF_SVG : SPEAKER_ON_SVG;
+        if (this.muteButton.dataset.icon !== (muted ? "off" : "on")) {
+          this.muteButton.dataset.icon = muted ? "off" : "on";
+          this.muteButton.innerHTML = nextHtml;
+        }
       }
       this.composer?.classList.toggle("ows-composer-live", live);
       this.strip?.classList.toggle("is-visible", live);
@@ -371,18 +410,19 @@ function injectStyle() {
 
     .ows-button, .ows-mute {
       display: inline-flex; align-items: center; justify-content: center;
-      background: transparent; border: 1px solid transparent; border-radius: 8px;
-      cursor: pointer; color: currentColor; flex: 0 0 auto;
-      transition: color .2s ease, background .2s ease, border-color .2s ease, box-shadow .2s ease;
+      flex: 0 0 auto; width: 28px; height: 28px; padding: 5px;
+      background: transparent; border: 1px solid transparent; border-radius: 6px;
+      cursor: pointer; color: var(--v2-text-text-muted, currentColor); opacity: .78;
+      -webkit-tap-highlight-color: transparent;
+      transition: color .16s ease, background .16s ease, border-color .16s ease, box-shadow .16s ease;
     }
-    .ows-button { width: 32px; height: 32px; margin-left: .25rem; opacity: .6; }
-    .ows-mute { width: 28px; height: 28px; margin-left: .15rem; opacity: .5; font-size: 13px; line-height: 1; }
-    .ows-button:hover, .ows-mute:hover { opacity: 1; background: color-mix(in srgb, currentColor 10%, transparent); }
-    .ows-button:focus-visible, .ows-mute:focus-visible { outline: 2px solid #0ea5b7; outline-offset: 2px; opacity: 1; }
-    .ows-mute.is-muted { opacity: .85; }
+    .ows-mute[hidden] { display: none; }
+    .ows-button:hover, .ows-mute:hover { opacity: 1; color: var(--v2-text-text-base, currentColor); background: rgba(128, 128, 128, .14); }
+    .ows-button:focus-visible, .ows-mute:focus-visible { outline: 2px solid #0ea5b7; outline-offset: 1px; opacity: 1; }
+    .ows-mute.is-muted { opacity: .9; color: #f59e0b; background: rgba(245,158,11,.12); border-color: rgba(245,158,11,.35); }
     .ows-button.is-offline { opacity: .3; cursor: not-allowed; }
-    .ows-button.is-nodir { opacity: .35; }
-    .ows-button.is-nodir:hover { opacity: .6; }
+    .ows-button.is-nodir { opacity: .38; }
+    .ows-button.is-nodir:hover { opacity: .65; }
 
     .ows-waves { display: flex; align-items: center; gap: 2px; height: 14px; }
     .ows-waves i { width: 2.5px; height: 5px; border-radius: 2px; background: currentColor; display: block; }
@@ -413,14 +453,19 @@ function injectStyle() {
     .ows-strip {
       position: fixed; left: 50%; bottom: 12px; transform: translateX(-50%) translateY(140%);
       z-index: 2147483000; max-width: min(760px, calc(100vw - 24px)); width: max-content;
-      background: color-mix(in srgb, Canvas 86%, #0ea5b7 4%); color: CanvasText;
-      border: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
-      border-radius: 12px; box-shadow: 0 10px 34px rgba(0,0,0,.28);
+      background: rgba(20, 22, 27, .94); color: #e8e8ea;
+      border: 1px solid rgba(255, 255, 255, .14);
+      border-radius: 12px; box-shadow: 0 10px 34px rgba(0,0,0,.35);
       backdrop-filter: blur(10px); opacity: 0; pointer-events: none;
-      transition: transform .28s cubic-bezier(.2,.9,.3,1), opacity .2s ease;
-      font: 400 13px/1.45 ui-sans-serif, system-ui, sans-serif;
+      transition: transform .22s cubic-bezier(.2,.9,.3,1), opacity .18s ease;
+      font: 400 12.5px/1.4 ui-sans-serif, system-ui, sans-serif;
+    }
+    .ows-strip.ows-strip-docked {
+      position: absolute; left: 10px; right: 10px; bottom: calc(100% + 8px);
+      width: auto; max-width: none; transform: translateY(8px); z-index: 42;
     }
     .ows-strip.is-visible { transform: translateX(-50%) translateY(0); opacity: 1; pointer-events: auto; }
+    .ows-strip.ows-strip-docked.is-visible { transform: translateY(0); }
     .ows-strip-inner { display: flex; align-items: flex-start; gap: 10px; padding: 9px 12px; }
     .ows-lines { display: grid; gap: 4px; min-width: 0; flex: 1 1 auto; }
     .ows-lines p { margin: 0; overflow-wrap: anywhere; }
@@ -449,10 +494,13 @@ function injectStyle() {
     .ows-chip-lang { font-family: ui-monospace, monospace; letter-spacing: .04em; min-width: 3.4em; text-align: center; }
     .ows-chip-cancel { border-color: rgba(220,38,38,.45); }
 
-    @media (max-width: 520px) {
+    @media (pointer: coarse), (max-width: 640px) {
+      .ows-button, .ows-mute { width: 32px; height: 32px; padding: 6px; }
       .ows-strip { left: 8px; right: 8px; transform: translateY(140%); width: auto; max-width: none; }
+      .ows-strip.ows-strip-docked { left: 4px; right: 4px; bottom: calc(100% + 6px); }
       .ows-strip.is-visible { transform: translateY(0); }
-      .ows-actions { flex-wrap: wrap; }
+      .ows-strip-inner { flex-wrap: wrap; gap: 8px; padding: 8px 10px; }
+      .ows-actions { flex-wrap: wrap; width: 100%; justify-content: flex-end; }
     }
     @media (prefers-reduced-motion: reduce) {
       .ows-strip { transition: opacity .2s ease; }
