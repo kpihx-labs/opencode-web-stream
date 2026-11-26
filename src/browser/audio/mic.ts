@@ -68,19 +68,28 @@ class OwsVadMeter extends AudioWorkletProcessor {
     this._acc = 0;
     this._n = 0;
     this._target = Math.max(128, Math.round((sampleRate || 48000) * 0.032));
+    this._buf = new Float32Array(this._target);
   }
   process(inputs) {
     const ch = inputs[0]?.[0];
     if (ch) {
-      for (let i = 0; i < ch.length; i++) {
-        this._acc += ch[i] * ch[i];
-      }
-      this._n += ch.length;
-      if (this._n >= this._target) {
-        const rms = Math.sqrt(this._acc / this._n);
-        this.port.postMessage(rms);
-        this._acc = 0;
-        this._n = 0;
+      let off = 0;
+      while (off < ch.length) {
+        const take = Math.min(ch.length - off, this._target - this._n);
+        for (let i = 0; i < take; i++) {
+          const v = ch[off + i];
+          this._acc += v * v;
+          this._buf[this._n + i] = v;
+        }
+        this._n += take;
+        off += take;
+        if (this._n >= this._target) {
+          const rms = Math.sqrt(this._acc / this._n);
+          const frame = this._buf.slice(0, this._n);
+          this.port.postMessage({ rms, pcm: frame }, [frame.buffer]);
+          this._acc = 0;
+          this._n = 0;
+        }
       }
     }
     return true;
@@ -107,6 +116,10 @@ export class Microphone {
   private lastVoiceAt = 0;
   private chunks: Blob[] = [];
   private preroll: Blob[] = [];
+  private headerChunk?: Blob;
+  private pcmChunks: Float32Array[] = [];
+  private pcmPreroll: Float32Array[] = [];
+  private useWorkletPcm = false;
   private ducked = false;
   private duckedUntil = 0;
   private startedDuringPlayback = false;
@@ -244,6 +257,7 @@ export class Microphone {
     }
     this.recorder.ondataavailable = (event) => {
       if (!event.data || event.data.size === 0) return;
+      if (!this.headerChunk) this.headerChunk = event.data;
       if (this.speaking) {
         this.chunks.push(event.data);
       } else {
@@ -268,8 +282,25 @@ export class Microphone {
       await this.context.audioWorklet.addModule(this.workletUrl);
       if (!this.running || !this.context || !this.source) return false;
       this.worklet = new AudioWorkletNode(this.context, "ows-vad-meter");
+      this.useWorkletPcm = true;
       this.worklet.port.onmessage = (event) => {
-        if (typeof event.data === "number") this.processRms(event.data);
+        const payload = event.data as number | { rms?: number; pcm?: Float32Array };
+        if (typeof payload === "number") {
+          this.processRms(payload);
+          return;
+        }
+        if (payload && typeof payload.rms === "number") {
+          if (payload.pcm instanceof Float32Array) {
+            if (this.speaking) {
+              this.pcmChunks.push(payload.pcm);
+            } else {
+              this.pcmPreroll.push(payload.pcm);
+              const maxFrames = Math.max(2, Math.ceil(this.opts.prerollMs / FRAME_MS));
+              while (this.pcmPreroll.length > maxFrames) this.pcmPreroll.shift();
+            }
+          }
+          this.processRms(payload.rms);
+        }
       };
       this.source.connect(this.worklet);
       return true;
@@ -323,6 +354,7 @@ export class Microphone {
         this.speechStartedAt = now;
         this.startedDuringPlayback = duckedNow;
         this.chunks = this.preroll.splice(0, this.preroll.length);
+        this.pcmChunks = this.pcmPreroll.splice(0, this.pcmPreroll.length);
         this.events.onSpeechStart();
       } else if (!this.confirmed && now - this.speechStartedAt >= confirmNeeded) {
         this.confirmed = true;
@@ -343,14 +375,22 @@ export class Microphone {
     this.confirmed = false;
     const chunks = this.chunks;
     this.chunks = [];
+    const pcmFrames = this.pcmChunks;
+    this.pcmChunks = [];
     this.events.onSilence();
-    if (!wasConfirmed || durationMs < this.opts.minUtteranceMs || chunks.length === 0) {
+    if (!wasConfirmed || durationMs < this.opts.minUtteranceMs || (pcmFrames.length === 0 && chunks.length === 0)) {
       log.debug("utterance discarded", { durationMs, confirmed: wasConfirmed });
       return;
     }
-    // Flush the recorder so the closing chunk is included before emitting.
+    if (this.useWorkletPcm && pcmFrames.length > 0 && this.context) {
+      const wavBlob = encodeWav16k(pcmFrames, this.context.sampleRate || 48000);
+      this.events.onUtterance(wavBlob, { durationMs: now - this.speechStartedAt, startedDuringPlayback });
+      return;
+    }
+    // Fallback MediaRecorder path: ensure container EBML header chunk #0 is preserved.
     const emit = () => {
-      const blob = new Blob(chunks, { type: chunks[0]?.type || "audio/webm" });
+      const out = this.headerChunk && chunks[0] !== this.headerChunk ? [this.headerChunk, ...chunks] : chunks;
+      const blob = new Blob(out, { type: out[0]?.type || "audio/webm" });
       this.events.onUtterance(blob, { durationMs: now - this.speechStartedAt, startedDuringPlayback });
     };
     if (this.recorder && this.recorder.state === "recording") {
@@ -385,6 +425,10 @@ export class Microphone {
     this.recorder = undefined;
     this.chunks = [];
     this.preroll = [];
+    this.headerChunk = undefined;
+    this.pcmChunks = [];
+    this.pcmPreroll = [];
+    this.useWorkletPcm = false;
     this.energies.length = 0;
     this.speaking = false;
     this.confirmed = false;
@@ -434,4 +478,48 @@ function pickMimeType(): string | undefined {
     if (MediaRecorder.isTypeSupported?.(type)) return type;
   }
   return undefined;
+}
+
+/** Downsample PCM float frames to a standard 16 kHz mono 16-bit RIFF WAV Blob. */
+export function encodeWav16k(frames: Float32Array[], sourceRate: number): Blob {
+  let total = 0;
+  for (const f of frames) total += f.length;
+  const targetRate = 16000;
+  const ratio = sourceRate > 0 ? sourceRate / targetRate : 3;
+  const outLen = Math.max(1, Math.floor(total / ratio));
+  const buf = new ArrayBuffer(44 + outLen * 2);
+  const view = new DataView(buf);
+  const writeStr = (off: number, s: string) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
+  };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + outLen * 2, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, targetRate, true);
+  view.setUint32(28, targetRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, outLen * 2, true);
+  // Flatten once for fast linear-interpolated resampling.
+  const mono = new Float32Array(total);
+  let pos = 0;
+  for (const f of frames) {
+    mono.set(f, pos);
+    pos += f.length;
+  }
+  for (let i = 0; i < outLen; i++) {
+    const srcIdx = i * ratio;
+    const i0 = Math.min(total - 1, Math.floor(srcIdx));
+    const i1 = Math.min(total - 1, i0 + 1);
+    const frac = srcIdx - i0;
+    const sample = mono[i0] * (1 - frac) + mono[i1] * frac;
+    const clamped = Math.max(-1, Math.min(1, sample));
+    view.setInt16(44 + i * 2, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+  }
+  return new Blob([buf], { type: "audio/wav" });
 }

@@ -203,9 +203,14 @@ export class SttEngine {
       });
       return { text, language: lang || undefined };
     } catch (e) {
+      const errObj = e as { message?: string; stdout?: string; stderr?: string };
       this.log.warn("hex stt failed", {
         elapsedMs: Date.now() - t0,
-        error: e instanceof Error ? e.message : String(e),
+        bytes: audio.length,
+        ext,
+        error: errObj?.message ?? String(e),
+        stdout: errObj?.stdout?.slice(0, 200),
+        stderr: errObj?.stderr?.slice(0, 200),
       });
       throw e;
     } finally {

@@ -139,10 +139,19 @@ export class DecisionEngine {
       return "pass";
     }
     const probs = ans.probabilities ?? {};
+    const wordCount = transcript.trim().split(/\s+/).filter(Boolean).length;
     let decision: VoiceTriage = "pass";
-    if (ans.choice === "stop" && (probs.stop ?? 0) >= 0.4) decision = "stop";
-    else if (ans.choice === "noise" && (probs.noise ?? 0) >= 0.42) decision = "noise";
-    else {
+    if (
+      ctx.speaking &&
+      wordCount <= 5 &&
+      ans.choice === "stop" &&
+      (probs.stop ?? 0) >= 0.42 &&
+      (probs.stop ?? 0) - (probs.pass ?? 0) >= 0.1
+    ) {
+      decision = "stop";
+    } else if (wordCount <= 2 && ans.choice === "noise" && (probs.noise ?? 0) >= 0.48) {
+      decision = "noise";
+    } else {
       const fromCtx = res?.answers?.from_context as NoulAnswer | undefined;
       if (ctx.hasScreenAnswer && fromCtx?.type === "noul" && typeof fromCtx.noul === "number" && fromCtx.noul >= 0.5) {
         decision = "answer_from_context";

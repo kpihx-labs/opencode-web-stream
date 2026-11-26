@@ -371,3 +371,38 @@ test("SttEngine toggles dynamically between hex local and browser online", async
   assert.equal(await stt.check(true), false);
   assert.equal(stt.describe().engine, "browser");
 });
+
+test("DecisionEngine never triggers stop on multi-word commands or when silent", async () => {
+  const fakeFetch = async (url) => {
+    if (String(url).endsWith("/v1/models")) return new Response("{}", { status: 200 });
+    return new Response(
+      JSON.stringify({
+        answers: {
+          intent: { type: "choice", choice: "stop", probabilities: { stop: 0.45, noise: 0.15, pass: 0.4 } },
+        },
+      }),
+      { status: 200 },
+    );
+  };
+  const engine = new DecisionEngine(DEFAULTS.decision, log, fakeFetch);
+  // Multi-word instruction mentioning "te taire" must pass through to streamer.
+  assert.equal(
+    await engine.triageVoice("Je te demande de ne pas te taire et faire la recherche", { speaking: true, busy: false }),
+    "pass",
+  );
+  // Short command when NOT speaking must not stop silently.
+  assert.equal(await engine.triageVoice("stop", { speaking: false, busy: false }), "pass");
+});
+
+test("encodeWav16k builds a valid 16 kHz mono RIFF WAV blob", async () => {
+  const encodeWav16k = extract("encodeWav16k");
+  const frame = new Float32Array(1536).fill(0.1);
+  const blob = encodeWav16k([frame], 48000);
+  assert.equal(blob.type, "audio/wav");
+  const buf = Buffer.from(await blob.arrayBuffer());
+  assert.equal(buf.subarray(0, 4).toString("ascii"), "RIFF");
+  assert.equal(buf.subarray(8, 12).toString("ascii"), "WAVE");
+  assert.equal(buf.readUInt32LE(24), 16000);
+  assert.equal(buf.readUInt16LE(34), 16);
+  assert.equal(buf.length, 44 + 512 * 2);
+});

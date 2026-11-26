@@ -253,10 +253,11 @@ export class OpencodeClient {
       );
       const promptCreatedAt =
         typeof promptRes?.data?.time?.created === "number" ? promptRes.data.time.created : fallbackStart;
-      // Poll briefly for the completed assistant message created by this prompt.
+      // Poll briefly for the completed assistant text reply created by this prompt.
+      // Never return early on an intermediate tool-call step with empty text while busy.
       const deadline = Date.now() + (opts.timeoutMs ?? 20000);
       while (Date.now() < deadline && !opts.signal?.aborted) {
-        const latest = await this.messages(sessionID, directory, 6).catch(() => []);
+        const latest = await this.messages(sessionID, directory, 8).catch(() => []);
         const reply = [...latest]
           .reverse()
           .find(
@@ -264,9 +265,23 @@ export class OpencodeClient {
               m.info.role === "assistant" &&
               !seenIds.has(m.info.id) &&
               m.info.time.created >= promptCreatedAt &&
-              m.info.time.completed,
+              m.info.time.completed &&
+              textOf(m.parts).length > 0,
           );
         if (reply) return reply;
+        const status = await this.sessionStatus(directory).catch(() => ({} as Record<string, SessionStatus>));
+        if (status[sessionID]?.type === "idle") {
+          const anyCompleted = [...latest]
+            .reverse()
+            .find(
+              (m) =>
+                m.info.role === "assistant" &&
+                !seenIds.has(m.info.id) &&
+                m.info.time.created >= promptCreatedAt &&
+                m.info.time.completed,
+            );
+          if (anyCompleted) return anyCompleted;
+        }
         await sleep(60, opts.signal);
       }
       const fallback = (await this.messages(sessionID, directory, 4).catch(() => []))
