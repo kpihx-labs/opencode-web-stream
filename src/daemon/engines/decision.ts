@@ -161,9 +161,9 @@ export class DecisionEngine {
     const probs = ans.probabilities ?? {};
     const passProb = probs.pass ?? 0;
     let decision: VoiceTriage = "pass";
-    if (ctx.speaking && ans.choice === "stop" && (probs.stop ?? 0) >= 0.5 && (probs.stop ?? 0) - passProb >= 0.12) {
+    if (ctx.speaking && ans.choice === "stop" && (probs.stop ?? 0) >= 0.65 && (probs.stop ?? 0) - passProb >= 0.25) {
       decision = "stop";
-    } else if (ans.choice === "noise" && (probs.noise ?? 0) >= 0.5 && (probs.noise ?? 0) - passProb >= 0.12) {
+    } else if (ans.choice === "noise" && (probs.noise ?? 0) >= 0.78 && (probs.noise ?? 0) - passProb >= 0.4) {
       decision = "noise";
     } else {
       const fromCtx = res?.answers?.from_context as NoulAnswer | undefined;

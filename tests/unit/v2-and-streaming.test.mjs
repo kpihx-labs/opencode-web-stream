@@ -60,7 +60,7 @@ test("DecisionEngine parses Ollaya /v1/systemone Choice and Noul responses", asy
         return new Response(JSON.stringify({ answers: { intent: { type: "choice", choice: "stop", confidence: 0.4, probabilities: { stop: 0.72, noise: 0.14, pass: 0.14 } } } }), { status: 200 });
       }
       if (state.includes("euh")) {
-        return new Response(JSON.stringify({ answers: { intent: { type: "choice", choice: "noise", confidence: 0.3, probabilities: { stop: 0.15, noise: 0.61, pass: 0.24 } } } }), { status: 200 });
+        return new Response(JSON.stringify({ answers: { intent: { type: "choice", choice: "noise", confidence: 0.77, probabilities: { stop: 0.05, noise: 0.85, pass: 0.1 } } } }), { status: 200 });
       }
       return new Response(JSON.stringify({ answers: { intent: { type: "choice", choice: "pass", confidence: 0.5, probabilities: { stop: 0.1, noise: 0.1, pass: 0.8 } } } }), { status: 200 });
     }
