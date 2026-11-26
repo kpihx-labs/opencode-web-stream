@@ -1,0 +1,30 @@
+{
+  "warmup": {
+    "intent": {
+      "type": "choice",
+      "instructions": "Warmup classification.",
+      "criteria": {
+        "stop": "stop",
+        "pass": "pass"
+      }
+    }
+  },
+  "voice": {
+    "instructions": "Classify the user voice utterance while using a live coding assistant.",
+    "criteria": {
+      "stop": "The user is ONLY telling the currently speaking voice to stop talking, shut up, or pause, with no new task or question.",
+      "noise": "Meaningless filler, cough, breath, or non-communicative noise (e.g. euh, hmm, uh) not directed at the assistant.",
+      "pass": "Any greeting, question, request, instruction, feedback, or meaningful speech directed at the assistant in any language."
+    },
+    "fromContext": {
+      "type": "noul",
+      "instructions": "Is the user asking to present, summarize, zoom in on, explain, or discuss results or topics already found or displayed on screen, rather than asking to write code or launch a brand new external action?"
+    }
+  },
+  "beat": {
+    "worthSpeaking": {
+      "type": "noul",
+      "instructions": "Is this tool-activity summary important or unexpected enough to inform the user aloud, rather than routine reading or listing?"
+    }
+  }
+}

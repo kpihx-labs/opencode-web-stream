@@ -266,7 +266,7 @@ test("interrupt mode aborts the session before injecting", async (t) => {
 
   assert.deepEqual(h.opencode.aborts, [session.id]);
   const voiceAsk = h.opencode.prompts.filter((p) => !p.body.noReply && p.body.parts[0].text.startsWith("[VOICE]")).at(-1);
-  assert.match(voiceAsk.body.parts[0].text, /cut you off while you were saying: Je lis le proxy/);
+  assert.match(voiceAsk.body.parts[0].text, /spoken_over: Je lis le proxy/);
 });
 
 test("a scheduled injection can be cancelled from the cockpit", async (t) => {

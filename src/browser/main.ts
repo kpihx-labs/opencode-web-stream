@@ -468,13 +468,13 @@ class CockpitApp {
     this.recognizer = new BrowserRecognizer({
       onFinal: (text) => {
         if (this.serverEars) {
-          if (!this.isSelfEcho(text)) this.ui.showInterim(text);
+          this.ui.showInterim(text);
           return;
         }
         void this.submitTranscript(text, this.consumeBargeIn());
       },
       onInterim: (text) => {
-        if (!this.isSelfEcho(text)) this.ui.showInterim(text);
+        this.ui.showInterim(text);
       },
       onError: (error) => log.debug("recognizer", error),
     });
@@ -487,54 +487,10 @@ class CockpitApp {
     log.info("switched to browser recognition", { lang: this.recognizerLang() });
   }
 
-  private isSelfEcho(text: string, spokenOver?: string): boolean {
-    const now = Date.now();
-    const activeWindow = this.player.isPlaying || now - this.lastSpokeAt <= 8000;
-    if (!activeWindow && now - this.lastSpokeAt > 15000) return false;
-    const norm = (s: string) =>
-      s
-        .toLowerCase()
-        .normalize("NFD")
-        .replace(/\p{M}+/gu, "")
-        .replace(/[^\p{L}\p{N}]+/gu, " ")
-        .trim();
-    const poolTexts = this.recentSpoken.filter((r) => now - r.at <= 25000).map((r) => r.text);
-    if (spokenOver) poolTexts.push(spokenOver);
-    if (!poolTexts.length) return false;
-    const normText = norm(text);
-    if (normText.length >= 12) {
-      for (const spoken of poolTexts) {
-        if (norm(spoken).includes(normText)) return true;
-      }
-    }
-    const words = normText.split(/\s+/).filter(Boolean);
-    if (words.length < 3) return false;
-    const poolWords = norm(poolTexts.join(" ")).split(/\s+/).filter(Boolean);
-    const pool = new Set(poolWords);
-    if (pool.size < 3) return false;
-    let hits = 0;
-    for (const w of words) {
-      if (pool.has(w)) {
-        hits += 1;
-      } else if (w.length >= 4 && poolWords.some((sw) => sw.length >= 4 && (sw.startsWith(w.slice(0, 4)) || w.startsWith(sw.slice(0, 4))))) {
-        hits += 0.85;
-      }
-    }
-    return hits / words.length >= 0.72;
-  }
-
   private async submitTranscript(text: string, context: { bargeIn: boolean; spokenOver?: string }) {
     if (!text.trim() || !this.live) return;
-    if (this.isSelfEcho(text, context.spokenOver)) {
-      log.debug("dropped client self-echo", { text: text.slice(0, 80) });
-      if (context.bargeIn) {
-        this.link.send({ type: "barge_in_false", sessionID: this.sessionID });
-        this.player.resume();
-      }
-      return;
-    }
     // Pause playback if still speaking; the daemon will send `cancel` (real user intent)
-    // or `resume` (if daemon-side echo/noise gate catches it), preserving full TTS on false alarms.
+    // or `resume` (if semantic/triage check sees echo or noise), preserving full TTS.
     if (this.player.isPlaying && !context.bargeIn) {
       const heard = this.player.interrupt();
       context = { bargeIn: true, spokenOver: heard || context.spokenOver };

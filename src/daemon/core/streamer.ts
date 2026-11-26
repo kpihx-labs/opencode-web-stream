@@ -183,7 +183,7 @@ export class StreamerSession {
     try {
       streamerID = await this.ensure();
       job.onStart?.();
-      const timer = setTimeout(() => controller.abort(new Error("timeout")), job.timeoutMs);
+      const timer = job.timeoutMs > 0 ? setTimeout(() => controller.abort(new Error("timeout")), job.timeoutMs) : undefined;
       const candidates = this.candidateModels;
       let res: Awaited<ReturnType<OpencodeClient["prompt"]>> | undefined;
       let lastErr: unknown;
@@ -210,7 +210,7 @@ export class StreamerSession {
               streamerID,
               this.directory,
               { agent: this.opts.agent, model, parts: [{ type: "text", text: job.prompt }] },
-              { signal: controller.signal, timeoutMs: job.timeoutMs + 2000 },
+              { signal: controller.signal, timeoutMs: job.timeoutMs > 0 ? job.timeoutMs + 2000 : 0 },
             );
             const attemptText = textOf(attemptRes?.parts);
             if (!attemptText && i + 1 < candidates.length) {
@@ -244,7 +244,7 @@ export class StreamerSession {
             }
           }
         }
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         if (!res) {
           throw lastErr ?? new Error("all streamer model candidates failed");
         }
@@ -254,7 +254,7 @@ export class StreamerSession {
         job.resolve({ text: textOf(res?.parts), aborted: false, timedOut: false, streamerID });
         if (prompts % this.opts.summarizeEveryPrompts === 0) void this.compact(streamerID, usedModel);
       } catch (e) {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         const reason = controller.signal.aborted ? String((controller.signal.reason as Error)?.message ?? "aborted") : "";
         if (reason) {
           // Stop the model on the server too; a preempted beat must not keep generating.

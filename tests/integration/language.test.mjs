@@ -134,7 +134,7 @@ test("speaking english switches the session, the streamer's briefing, and the vo
   await until(() => h.spoken().length > 0, { label: "reply" });
 
   const voiceAsk = h.opencode.prompts.filter((p) => p.body.parts[0].text.startsWith("[VOICE]")).at(-1);
-  assert.match(voiceAsk.body.parts[0].text, /language: en \(recognizer said en-US\)/);
+  assert.match(voiceAsk.body.parts[0].text, /language: en \(en-US\)/);
   assert.equal(h.spoken()[0].lang, "en");
 
   // The cockpit asks for audio in that language and gets the english voice.

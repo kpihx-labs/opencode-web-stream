@@ -136,7 +136,7 @@ export class Microphone {
       hangoverMs: opts.hangoverMs ?? 550,
       prerollMs: opts.prerollMs ?? 400,
       minUtteranceMs: opts.minUtteranceMs ?? 380,
-      maxUtteranceMs: opts.maxUtteranceMs ?? 30000,
+      maxUtteranceMs: opts.maxUtteranceMs ?? 0,
       marginDb: opts.marginDb ?? 9,
       holdMarginDb: opts.holdMarginDb ?? 5,
       duckedMarginDb: opts.duckedMarginDb ?? 26,
@@ -360,7 +360,7 @@ export class Microphone {
         this.confirmed = true;
         this.events.onSpeechConfirmed();
       }
-      if (now - this.speechStartedAt > this.opts.maxUtteranceMs) this.closeUtterance(now);
+      if (this.opts.maxUtteranceMs > 0 && now - this.speechStartedAt > this.opts.maxUtteranceMs) this.closeUtterance(now);
       return;
     }
 

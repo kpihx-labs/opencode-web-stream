@@ -1,5 +1,4 @@
 import type { LiveState } from "../shared/protocol.js";
-import { phrase, pickLang } from "../shared/phrases.js";
 
 /**
  * The cockpit's surface inside OpenCode Web.
@@ -327,25 +326,10 @@ export class Cockpit {
   }
 
   private describe(): string {
-    if (!this.state.connected) return "Live : démon injoignable";
-    if (!this.state.live && this.state.noDir) {
-      // The selector value ("fr-FR", "en-US", "auto"); "auto" follows the browser.
-      const tag = this.state.lang === "auto" ? navigator.language : this.state.lang;
-      return phrase(pickLang(tag), "cockpit.liveButton.noDir");
-    }
-    if (!this.state.live) return "Live : éteint, cliquer pour activer";
-    const map: Record<LiveState, string> = {
-      idle: "Live : au repos",
-      listening: "Live : je t'écoute",
-      thinking: "Live : je travaille",
-      speaking: "Live : je parle",
-      interrupted: "Live : je t'écoute, vas-y",
-      waiting_user: "Live : j'attends ta réponse",
-      away: "Live : en veille",
-    };
-    const ears = this.state.serverEars ? "oreilles locales" : "oreilles navigateur";
-    const voice = this.state.serverVoice ? "voix locale" : "voix navigateur";
-    return `${map[this.state.state]} (${ears}, ${voice})`;
+    if (!this.state.connected) return "Live : offline";
+    if (!this.state.live && this.state.noDir) return "Live : no directory";
+    if (!this.state.live) return "Live";
+    return `Live : ${this.state.state} (${this.state.sttEngine})`;
   }
 
   setLevel(level: number) {

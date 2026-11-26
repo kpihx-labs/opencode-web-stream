@@ -150,7 +150,7 @@ export class SttEngine {
     const terms = (opts.promptTerms ?? []).slice(0, this.cfg.promptTerms);
     if (terms.length) form.set("prompt", buildPrompt(terms));
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error("stt timeout")), this.cfg.timeoutMs);
+    const timer = this.cfg.timeoutMs > 0 ? setTimeout(() => controller.abort(new Error("stt timeout")), this.cfg.timeoutMs) : undefined;
     const onAbort = () => controller.abort(opts.signal?.reason);
     opts.signal?.addEventListener("abort", onAbort, { once: true });
     try {
@@ -166,7 +166,7 @@ export class SttEngine {
       if (!(e instanceof Error && /HTTP/.test(e.message))) this.ready = false;
       throw e;
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onAbort);
     }
   }
@@ -189,7 +189,7 @@ export class SttEngine {
       const args = ["transcribe", tmpPath, "--model", model, "--json"];
       if (lang && model !== "orukeet") args.push("--language", lang);
       const { stdout } = await execFile(this.cfg.binary || "hex", args, {
-        timeout: this.cfg.timeoutMs,
+        ...(this.cfg.timeoutMs > 0 ? { timeout: this.cfg.timeoutMs } : {}),
         signal: opts.signal,
       });
       const parsed = JSON.parse(stdout) as { text?: string };

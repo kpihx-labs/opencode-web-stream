@@ -124,7 +124,7 @@ export class TtsEngine {
       speed,
     };
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error("tts timeout")), this.cfg.timeoutMs);
+    const timer = this.cfg.timeoutMs > 0 ? setTimeout(() => controller.abort(new Error("tts timeout")), this.cfg.timeoutMs) : undefined;
     const onAbort = () => controller.abort(opts.signal?.reason);
     opts.signal?.addEventListener("abort", onAbort, { once: true });
     try {
@@ -145,7 +145,7 @@ export class TtsEngine {
       if (!(e instanceof Error && /HTTP/.test(e.message))) this.ready = false;
       throw e;
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onAbort);
     }
   }

@@ -129,7 +129,7 @@ test("without a directory the daemon says so instead of crashing", async (t) => 
 
   h.send({ type: "live", sessionID: "", enabled: true });
   await until(() => h.of("error").length > 0, { label: "error" });
-  assert.match(h.of("error")[0].message, /dossier/);
+  assert.equal(h.of("error")[0].message, "no_directory");
 
   h.send({ type: "transcript", sessionID: "", text: "fais quelque chose", bargeIn: false });
   await new Promise((r) => setTimeout(r, 150));

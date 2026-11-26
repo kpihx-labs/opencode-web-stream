@@ -437,7 +437,7 @@ export async function synthesizeEdgeTts(
 ): Promise<EdgeTtsOutput> {
   const voice = normalizeEdgeVoice(opts.voice, opts.lang);
   const rate = speedToRate(opts.speed ?? 1.0);
-  const timeoutMs = opts.timeoutMs ?? 20000;
+  const timeoutMs = opts.timeoutMs ?? 0;
 
   try {
     return await runEdgeWs(text, voice, rate, timeoutMs, opts.signal);
@@ -470,7 +470,7 @@ function runEdgeWs(
     let settled = false;
 
     const cleanup = () => {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       outerSignal?.removeEventListener("abort", onAbort);
     };
     const fail = (err: unknown) => {
@@ -511,7 +511,7 @@ function runEdgeWs(
     }
     outerSignal?.addEventListener("abort", onAbort, { once: true });
 
-    const timer = setTimeout(() => fail(new Error("edge-tts timeout")), timeoutMs);
+    const timer = timeoutMs > 0 ? setTimeout(() => fail(new Error("edge-tts timeout")), timeoutMs) : undefined;
 
     ws.on("unexpected-response", (_req, res) => {
       if (res.statusCode === 403) {

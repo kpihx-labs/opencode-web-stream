@@ -101,7 +101,8 @@ export class OpencodeClient {
       if (v !== undefined) url.searchParams.set(k, String(v));
     }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error("timeout")), opts.timeoutMs ?? this.defaultTimeoutMs);
+    const timeoutMs = opts.timeoutMs ?? this.defaultTimeoutMs;
+    const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(new Error("timeout")), timeoutMs) : undefined;
     const onOuterAbort = () => controller.abort(opts.signal?.reason ?? new Error("aborted"));
     opts.signal?.addEventListener("abort", onOuterAbort, { once: true });
     try {
@@ -120,7 +121,7 @@ export class OpencodeClient {
       if (!text) return undefined as T;
       return JSON.parse(text) as T;
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onOuterAbort);
     }
   }
@@ -247,7 +248,7 @@ export class OpencodeClient {
         {
           directory,
           body: { text },
-          timeoutMs: opts.timeoutMs ?? 120000,
+          timeoutMs: opts.timeoutMs === 0 ? 0 : (opts.timeoutMs ?? 120000),
           signal: opts.signal,
         },
       );
@@ -255,7 +256,7 @@ export class OpencodeClient {
         typeof promptRes?.data?.time?.created === "number" ? promptRes.data.time.created : fallbackStart;
       // Poll briefly for the completed assistant text reply created by this prompt.
       // Never return early on an intermediate tool-call step with empty text while busy.
-      const deadline = Date.now() + (opts.timeoutMs ?? 20000);
+      const deadline = opts.timeoutMs === 0 ? Number.POSITIVE_INFINITY : Date.now() + (opts.timeoutMs ?? 20000);
       while (Date.now() < deadline && !opts.signal?.aborted) {
         const latest = await this.messages(sessionID, directory, 8).catch(() => []);
         const reply = [...latest]

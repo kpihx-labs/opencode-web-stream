@@ -11,7 +11,6 @@ import type {
 } from "../../shared/opencode-events.js";
 import { isTextPart, isToolPart } from "../../shared/opencode-events.js";
 import { MAX_UTTERANCE_CHARS, type ControlAction, type LiveState, type ServerMessage, type SessionSnapshot, type SpeechKind, type Utterance } from "../../shared/protocol.js";
-import { phrase, pickLang } from "../../shared/phrases.js";
 import { shortLang, type Config } from "../config.js";
 import type { Logger, ScopedLogger } from "../log.js";
 import { buildLexicon, type Lexicon } from "../lexicon/build.js";
@@ -228,7 +227,6 @@ export class Orchestrator {
     if (!sessionID) {
       if (!directoryHint) {
         this.log.warn("live on a new session without a directory");
-        if (enabled) this.speakNoDirectory(lang);
         return undefined;
       }
       if (enabled) {
@@ -269,23 +267,6 @@ export class Orchestrator {
       this.setPhase(s, "idle");
     }
     return this.snapshot(sessionID);
-  }
-
-  /**
-   * Tell the cockpit, out loud and in its own language, why live cannot
-   * start. No session exists yet so this bypasses the per-session speech
-   * queue and talks straight to the cockpit sitting on the empty page.
-   */
-  private speakNoDirectory(langTag?: string) {
-    const lang = pickLang(langTag, this.cfg.speech.default);
-    this.out.speak({
-      id: `utt_${randomUUID().slice(0, 10)}`,
-      sessionID: "",
-      kind: "system",
-      text: phrase(lang, "daemon.noDirectory"),
-      expiresAt: 0,
-      lang: this.cfg.speech.default,
-    });
   }
 
   /** Fill title, agent, model, last prompt and answer from the server. */
@@ -1108,7 +1089,7 @@ export class Orchestrator {
     if (!s) return;
     if (completed && s.phase === "speaking") this.setPhase(s, s.status === "busy" ? "thinking" : s.pending ? "waiting_user" : "listening");
     if (heardText !== undefined && s.streamer && !completed) {
-      void s.streamer.seed(`[HEARD]\nThe user heard only this before cutting in: ${excerpt(heardText, 300)}`).catch(() => undefined);
+      void s.streamer.seed(`[HEARD]\nheard: ${excerpt(heardText, 300)}`).catch(() => undefined);
     }
   }
 
@@ -1147,16 +1128,6 @@ export class Orchestrator {
       sessionID = created;
     }
     const s = this.sessions.get(sessionID) ?? this.ensureSession(sessionID, opts.directory ?? "");
-    const echoPool = opts.spokenOver ? [...s.recentSpoken, { text: opts.spokenOver, at: Date.now() }] : s.recentSpoken;
-    if (isEchoOfSpoken(raw, echoPool, s.lastSpoken)) {
-      this.log.debug("ignoring self-echo transcript", { sessionID: s.id, raw: raw.slice(0, 120) });
-      this.out.toSession(s.id, { type: "heard", sessionID: s.id, raw, corrected: raw, decision: "echo(ignored)" });
-      if (opts.bargeIn || s.phase === "interrupted") {
-        this.out.toSession(s.id, { type: "resume", sessionID: s.id });
-        this.setPhase(s, "speaking");
-      }
-      return "echo";
-    }
     if (!s.live) {
       await this.setLive(sessionID, true, opts.directory, opts.lang);
     }
@@ -1180,7 +1151,7 @@ export class Orchestrator {
         busy: s.status === "busy",
         hasScreenAnswer: hasScreenData,
       });
-      if (triage === "noise" && raw.split(/\s+/).length <= 2) {
+      if (triage === "noise") {
         s.lastHeard = { raw, corrected: raw };
         this.out.toSession(s.id, { type: "heard", sessionID: s.id, raw, corrected: raw, decision: "quiet(local)" });
         if (opts.bargeIn) this.out.toSession(s.id, { type: "resume", sessionID: s.id });
@@ -1198,34 +1169,32 @@ export class Orchestrator {
     const lexicon = await this.lexiconFor(s.directory);
     const candidates = candidatesFor(raw, lexicon, this.registry.aliases(), { limit: this.cfg.lexicon.candidateTerms });
     const lines = ["[VOICE]", `transcript: ${raw}`];
-    lines.push(`main agent you embody: ${s.agent || "Colab"}`);
-    lines.push(`language: ${s.lang}${opts.lang ? ` (recognizer said ${opts.lang})` : ""}`);
-    lines.push(`session is ${s.status}${s.answer ? " and answering" : ""}`);
-    if (opts.bargeIn) lines.push(`The user cut you off while you were saying: ${excerpt(opts.spokenOver ?? s.lastSpoken ?? "", 300)}`);
-    else if (s.lastSpoken) lines.push(`last thing you said: ${excerpt(s.lastSpoken, 200)}`);
+    lines.push(`agent: ${s.agent || "Colab"}`);
+    lines.push(`language: ${s.lang}${opts.lang ? ` (${opts.lang})` : ""}`);
+    lines.push(`status: ${s.status}${s.answer ? " answering" : ""}`);
+    if (opts.bargeIn) lines.push(`spoken_over: ${excerpt(opts.spokenOver ?? s.lastSpoken ?? "", 300)}`);
+    else if (s.lastSpoken) lines.push(`last_spoken: ${excerpt(s.lastSpoken, 200)}`);
     if (s.pending?.kind === "permission") {
-      lines.push(`pending permission: ${s.pending.req.permission} on ${s.pending.req.patterns.join(", ")} (answers: once | always | reject)`);
+      lines.push(`pending_permission: ${s.pending.req.permission} (${s.pending.req.patterns.join(", ")}) [once|always|reject]`);
     } else if (s.pending?.kind === "question") {
-      lines.push(`pending question: ${s.pending.req.questions.map((q) => `${q.question} [${q.options.map((o) => o.label).join(" | ")}]`).join(" ; ")}`);
+      lines.push(`pending_question: ${s.pending.req.questions.map((q) => `${q.question} [${q.options.map((o) => o.label).join(" | ")}]`).join(" ; ")}`);
     }
-    if (s.clarify) lines.push(`you asked for clarification: "${excerpt(s.clarify.question, 200)}" about: "${excerpt(s.clarify.transcript, 200)}"`);
-    if (s.userPrompt) lines.push(`current task: ${excerpt(s.userPrompt, 300)}`);
+    if (s.clarify) lines.push(`clarify: "${excerpt(s.clarify.question, 200)}" -> "${excerpt(s.clarify.transcript, 200)}"`);
+    if (s.userPrompt) lines.push(`task: ${excerpt(s.userPrompt, 300)}`);
     if (screenAnswer) {
       const answerLimit = triage === "answer_from_context" ? 3200 : 1200;
-      lines.push(`current answer on screen:\n${screenAnswer.slice(0, answerLimit)}`);
+      lines.push(`answer:\n${screenAnswer.slice(0, answerLimit)}`);
     }
     if (s.recentFindings.length && triage === "answer_from_context") {
-      lines.push(`recent tool findings:\n${s.recentFindings.slice(-2).join("\n").slice(0, 1200)}`);
+      lines.push(`findings:\n${s.recentFindings.slice(-2).join("\n").slice(0, 1200)}`);
     }
     if (s.todo) lines.push(`plan: ${excerpt(s.todo, 300)}`);
     if (triage === "answer_from_context" && hasScreenData) {
-      lines.push(
-        "routing hint (local System-One): The user is asking to present, filter, or explain results ALREADY available in the current answer / tool findings above. Answer directly and conversationally with <reply>…</reply> using those findings. Do NOT emit <inject>.",
-      );
+      lines.push("triage: answer_from_context");
     }
     if (candidates.length) {
-      lines.push("project terms that sound like parts of the transcript (heard → term):");
-      for (const c of candidates) lines.push(`- "${c.heard}" → ${c.term}`);
+      lines.push("candidates:");
+      for (const c of candidates) lines.push(`- "${c.heard}" -> ${c.term}`);
     }
     const res = await this.askStreamer(s, "voice", lines.join("\n"), this.cfg.streamer.voiceTimeoutMs, "reply");
     if (!res) {
@@ -1477,42 +1446,6 @@ export function sessionUrl(directory: string, sessionID: string): string {
   return `/${Buffer.from(directory, "utf8").toString("base64")}/session/${encodeURIComponent(sessionID)}`;
 }
 
-/**
- * Language-agnostic echo check: compares Unicode-normalized contiguous spans and
- * high token overlap against recently spoken TTS utterances. No language-specific
- * stopword lists.
- */
-export function isEchoOfSpoken(
-  transcript: string,
-  recentSpoken: Array<{ text: string; at: number }>,
-  lastSpoken?: string,
-  now = Date.now(),
-): boolean {
-  const recentTexts = recentSpoken.filter((r) => now - r.at <= 25000).map((r) => r.text);
-  if (lastSpoken) recentTexts.push(lastSpoken);
-  if (!recentTexts.length) return false;
-  const normTranscript = normalizeEchoText(transcript);
-  if (normTranscript.length >= 12) {
-    for (const spoken of recentTexts) {
-      if (normalizeEchoText(spoken).includes(normTranscript)) return true;
-    }
-  }
-  const words = tokenizeEchoWords(transcript);
-  if (words.length < 3) return false;
-  const spokenWords = tokenizeEchoWords(recentTexts.join(" "));
-  const spokenPool = new Set(spokenWords);
-  if (spokenPool.size < 3) return false;
-  let hits = 0;
-  for (const w of words) {
-    if (spokenPool.has(w)) {
-      hits += 1;
-    } else if (w.length >= 4 && spokenWords.some((sw) => sw.length >= 4 && (sw.startsWith(w.slice(0, 4)) || w.startsWith(sw.slice(0, 4))))) {
-      hits += 0.85;
-    }
-  }
-  return hits / words.length >= 0.72;
-}
-
 /** Strip residual Markdown/formatting from spoken replies so TTS never reads asterisks or hashes aloud. */
 export function cleanSpokenText(text: string): string {
   return text
@@ -1522,19 +1455,4 @@ export function cleanSpokenText(text: string): string {
     .replace(/\s*—\s*/g, ", ")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-function normalizeEchoText(text: string): string {
-  return text
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/\p{M}+/gu, "")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim();
-}
-
-function tokenizeEchoWords(text: string): string[] {
-  return normalizeEchoText(text)
-    .split(/\s+/)
-    .filter(Boolean);
 }

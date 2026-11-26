@@ -9,7 +9,6 @@ import { OpencodeClient } from "../../dist/daemon/opencode/client.js";
 import { DecisionEngine } from "../../dist/daemon/engines/decision.js";
 import { SttEngine } from "../../dist/daemon/engines/stt.js";
 import { normalizeEdgeVoice, generateSecMsGecV2 } from "../../dist/daemon/engines/edge-tts.js";
-import { isEchoOfSpoken } from "../../dist/daemon/core/orchestrator.js";
 import { Registry } from "../../dist/daemon/core/registry.js";
 import { StreamerSession } from "../../dist/daemon/core/streamer.js";
 import { Logger } from "../../dist/daemon/log.js";
@@ -344,15 +343,6 @@ test("StreamerSession tries configured streamer.models in order when one fails",
   }
 });
 
-test("isEchoOfSpoken catches contiguous and high-overlap TTS echo snippets without blocking user questions", () => {
-  const now = Date.now();
-  const recent = [{ text: "Voici la synthèse des avancées technologiques sur cette recherche.", at: now - 1200 }];
-  assert.equal(isEchoOfSpoken("la synthèse des avancées technologiques", recent, recent[0].text, now), true);
-  assert.equal(isEchoOfSpoken("Voici la synthese des avancees", recent, recent[0].text, now), true);
-  assert.equal(isEchoOfSpoken("Où en est la recherche ?", recent, recent[0].text, now), false);
-  assert.equal(isEchoOfSpoken("ouvre le fichier config", recent, recent[0].text, now), false);
-});
-
 test("SttEngine toggles dynamically between hex local and browser online", async () => {
   const stt = new SttEngine({ ...DEFAULTS.stt, mode: "hex" }, log);
   assert.equal(stt.mode, "hex");
@@ -363,9 +353,11 @@ test("SttEngine toggles dynamically between hex local and browser online", async
   assert.equal(stt.describe().engine, "browser");
 });
 
-test("DecisionEngine never triggers stop on multi-word commands or when silent", async () => {
-  const fakeFetch = async (url) => {
+test("DecisionEngine reads external agent/decision.prompt.json and respects speaking state without text heuristics", async () => {
+  const seen = [];
+  const fakeFetch = async (url, init) => {
     if (String(url).endsWith("/v1/models")) return new Response("{}", { status: 200 });
+    seen.push(JSON.parse(init.body));
     return new Response(
       JSON.stringify({
         answers: {
@@ -376,13 +368,12 @@ test("DecisionEngine never triggers stop on multi-word commands or when silent",
     );
   };
   const engine = new DecisionEngine(DEFAULTS.decision, log, fakeFetch);
-  // Multi-word instruction mentioning "te taire" must pass through to streamer.
   assert.equal(
     await engine.triageVoice("Je te demande de ne pas te taire et faire la recherche", { speaking: true, busy: false }),
     "pass",
   );
-  // Short command when NOT speaking must not stop silently.
   assert.equal(await engine.triageVoice("stop", { speaking: false, busy: false }), "pass");
+  assert.equal(seen.at(-1).questions.intent.criteria.stop, undefined);
 });
 
 test("encodeWav16k builds a valid 16 kHz mono RIFF WAV blob", async () => {

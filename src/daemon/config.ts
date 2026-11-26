@@ -126,14 +126,14 @@ export const DEFAULTS: Config = {
     enabled: true,
     url: "http://127.0.0.1:11435/v1/systemone",
     model: "largha",
-    timeoutMs: 800,
+    timeoutMs: 0,
   },
   streamer: {
     agent: "streamer",
     model: "",
     models: [],
-    beatTimeoutMs: 15000,
-    voiceTimeoutMs: 25000,
+    beatTimeoutMs: 0,
+    voiceTimeoutMs: 0,
     summarizeEveryPrompts: 80,
     injectDelayMs: 1500,
     blockedRepeatMs: 45000,
@@ -149,8 +149,8 @@ export const DEFAULTS: Config = {
   answer: {
     mode: "full",
     codeRatioForDigest: 0.5,
-    codeNotice: "Je te mets le code à l'écran.",
-    tableNotice: "Je t'affiche un tableau à l'écran.",
+    codeNotice: "",
+    tableNotice: "",
     minAnswerCharsForDigest: 600,
   },
   speech: {
@@ -164,7 +164,7 @@ export const DEFAULTS: Config = {
     model: "orukeet",
     language: "auto",
     promptTerms: 60,
-    timeoutMs: 20000,
+    timeoutMs: 0,
   },
   tts: {
     mode: "auto",
@@ -174,7 +174,7 @@ export const DEFAULTS: Config = {
     voices: { fr: "fr-FR-DeniseNeural", en: "en-US-JennyNeural" },
     format: "mp3",
     speed: 1.08,
-    timeoutMs: 20000,
+    timeoutMs: 0,
   },
   lexicon: {
     maxFiles: 6000,

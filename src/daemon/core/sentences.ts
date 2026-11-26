@@ -41,8 +41,8 @@ export class SentenceSplitter {
 
   constructor(opts: SplitterOptions = {}) {
     this.opts = {
-      codeNotice: opts.codeNotice ?? "Je te mets le code à l'écran.",
-      tableNotice: opts.tableNotice ?? "Je t'affiche un tableau à l'écran.",
+      codeNotice: opts.codeNotice ?? "",
+      tableNotice: opts.tableNotice ?? "",
       locale: opts.locale ?? "fr",
       minChars: opts.minChars ?? 12,
       maxChars: opts.maxChars ?? MAX_UTTERANCE_CHARS,
