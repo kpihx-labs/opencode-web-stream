@@ -21,7 +21,7 @@ import { postTts, type TtsBoundary, type TtsPayload } from "../net.js";
  */
 
 export type PlayerEvents = {
-  onStart: (utterance: Utterance) => void;
+  onStart: (utterance: Utterance, resumed?: boolean) => void;
   onEnd: (utterance: Utterance, completed: boolean, heardText: string) => void;
   onIdle: () => void;
   onError: (error: unknown) => void;
@@ -36,6 +36,8 @@ type QueueItem = {
   decodedBuffer?: AudioBuffer;
   boundaries?: TtsBoundary[];
   resumeOffsetSec?: number;
+  /** True once `onStart` has notified the UI for this item. */
+  announced?: boolean;
 };
 
 export type PlayerOptions = {
@@ -136,6 +138,10 @@ export class VoicePlayer {
 
   get isPlaying(): boolean {
     return this.playing;
+  }
+
+  get isPaused(): boolean {
+    return this.paused;
   }
 
   get pending(): number {
@@ -268,13 +274,18 @@ export class VoicePlayer {
         const playedSec = Math.max(0, context.currentTime - startedAt) * this.rate;
         const totalOffsetSec = baseOffsetSec + playedSec;
         if (pause && !completed) {
-          // Keep exact decoded buffer + position (minus 150ms overlap) so resume() picks up seamlessly.
-          this.pausedItem = {
-            ...item,
-            decodedBuffer: buffer,
-            boundaries,
-            resumeOffsetSec: Math.max(0, totalOffsetSec - 0.15),
-          };
+          // Keep exact decoded buffer + position (minus 150ms overlap) unless the item already virtually finished.
+          if (buffer.duration - totalOffsetSec > 0.18) {
+            this.pausedItem = {
+              ...item,
+              decodedBuffer: buffer,
+              boundaries,
+              resumeOffsetSec: Math.max(0, totalOffsetSec - 0.15),
+              announced: true,
+            };
+          } else {
+            this.pausedItem = undefined;
+          }
         }
         const fraction = buffer.duration > 0 ? Math.min(1, totalOffsetSec / buffer.duration) : 1;
         const exactHeard = !completed && boundaries?.length ? heardFromBoundaries(boundaries, totalOffsetSec * 1000) : undefined;
@@ -299,7 +310,9 @@ export class VoicePlayer {
         },
       };
       try {
-        this.events.onStart(item.utterance);
+        const wasAnnounced = Boolean(item.announced);
+        item.announced = true;
+        this.events.onStart(item.utterance, wasAnnounced);
         source.start(0, baseOffsetSec);
       } catch (err) {
         log.warn("audio start failed", err);
@@ -375,7 +388,9 @@ export class VoicePlayer {
           advance();
         }
       };
-      this.events.onStart(item.utterance);
+      const wasAnnounced = Boolean(item.announced);
+      item.announced = true;
+      this.events.onStart(item.utterance, wasAnnounced);
       speakNext(0);
     });
   }

@@ -156,3 +156,11 @@ test("the draft store reveals the folder on a new-session page", () => {
     delete globalThis.localStorage;
   }
 });
+
+test("pause/resume guards against deadlocks and duplicate je dis rows", () => {
+  assert.match(bundle, /isPaused/);
+  assert.match(bundle, /resumePlaybackNow/);
+  assert.match(bundle, /announcedSayIds/);
+  assert.match(bundle, /pendingHeards/);
+  assert.match(bundle, /onUtteranceDiscarded/);
+});

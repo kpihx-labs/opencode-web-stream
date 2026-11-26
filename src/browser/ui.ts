@@ -58,7 +58,8 @@ export class Cockpit {
   private interimLine?: HTMLElement;
   private injectBox?: HTMLElement;
   private levelBar?: HTMLElement;
-  private pendingHeard?: { row: HTMLElement; raw: string };
+  private pendingHeards: Array<{ row: HTMLElement; raw: string }> = [];
+  private readonly announcedSayIds = new Set<string>();
   private observer?: MutationObserver;
   private resizeHandler?: () => void;
   private composer?: HTMLElement;
@@ -360,7 +361,7 @@ export class Cockpit {
 
   private clearFeed() {
     if (!this.feed) return;
-    this.pendingHeard = undefined;
+    this.pendingHeards = [];
     this.painting = true;
     try {
       this.feed.innerHTML = "";
@@ -383,24 +384,30 @@ export class Cockpit {
     const body = changed
       ? `<span class="ows-tag">entendu</span> <span class="ows-raw">${escapeHtml(raw)}</span> <span class="ows-arrow">→</span> ${escapeHtml(corrected)} <span class="ows-decision">${escapeHtml(decision)}</span>`
       : `<span class="ows-tag">entendu</span> ${escapeHtml(raw)} <span class="ows-decision">${escapeHtml(decision)}</span>`;
-    if (this.pendingHeard && this.pendingHeard.raw === raw && this.pendingHeard.row.isConnected) {
-      const slot = this.pendingHeard.row.querySelector(".ows-entry-body");
-      if (slot) {
-        this.painting = true;
-        try {
-          slot.innerHTML = body;
-        } finally {
-          queueMicrotask(() => {
-            this.painting = false;
-          });
+    this.pendingHeards = this.pendingHeards.filter((p) => p.row.isConnected);
+    if (decision !== "…") {
+      const idx = this.pendingHeards.findIndex((p) => p.raw === raw);
+      if (idx >= 0) {
+        const [match] = this.pendingHeards.splice(idx, 1);
+        const slot = match.row.querySelector(".ows-entry-body");
+        if (slot) {
+          this.painting = true;
+          try {
+            slot.innerHTML = body;
+          } finally {
+            queueMicrotask(() => {
+              this.painting = false;
+            });
+          }
         }
+        return;
       }
-      if (decision !== "…") this.pendingHeard = undefined;
-      return;
     }
     const row = this.appendEntry("heard", body);
-    if (decision === "…" && row) this.pendingHeard = { row, raw };
-    else this.pendingHeard = undefined;
+    if (decision === "…" && row) {
+      this.pendingHeards.push({ row, raw });
+      if (this.pendingHeards.length > 10) this.pendingHeards.shift();
+    }
   }
 
   showInterim(text: string) {
@@ -413,8 +420,15 @@ export class Cockpit {
     this.interimLine.innerHTML = `<span class="ows-tag">…</span> <span class="ows-raw">${escapeHtml(text)}</span>`;
   }
 
-  showSaying(text: string | undefined) {
+  showSaying(text: string | undefined, utteranceId?: string) {
     if (!text) return;
+    if (utteranceId) {
+      if (this.announcedSayIds.has(utteranceId)) return;
+      this.announcedSayIds.add(utteranceId);
+      if (this.announcedSayIds.size > 120) {
+        this.announcedSayIds.delete(this.announcedSayIds.values().next().value as string);
+      }
+    }
     this.appendEntry("say", `<span class="ows-tag ows-tag-say">je dis</span> ${escapeHtml(text)}`);
   }
 

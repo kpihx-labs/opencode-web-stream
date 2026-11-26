@@ -200,3 +200,29 @@ test("default digest mode never sends raw main-agent text to TTS and presents cl
   assert.equal(h.spoken()[0].text, "Tu as 35 projets actifs dans ton contexte.");
   assert.equal(h.spoken()[0].kind, "reply");
 });
+
+test("newer voice turn supersedes stalled voice turn without fallback-injecting the stale prompt", async (t) => {
+  const h = await setup();
+  t.after(() => h.cleanup());
+  const session = h.opencode.addSession({ id: "ses_super", directory: DIRECTORY });
+  h.send({ type: "attach", sessionID: session.id, directory: DIRECTORY, protocol: 5, visible: true });
+  h.send({ type: "live", sessionID: session.id, enabled: true, directory: DIRECTORY });
+  await until(() => h.opencode.prompts.some((p) => p.body.noReply), { label: "seeded" });
+
+  // Stall first voice prompt so user re-asks before firstToken arrives.
+  h.opencode.promptDelayMs = 350;
+  h.opencode.replyWith("<reply>Première réponse obsolète.</reply>");
+  h.send({ type: "transcript", sessionID: session.id, text: "Dis-moi plus sur toi", bargeIn: false, directory: DIRECTORY });
+  await new Promise((r) => setTimeout(r, 80));
+
+  h.opencode.promptDelayMs = 0;
+  h.opencode.replyWith("<reply>Voici la réponse directe.</reply>");
+  h.send({ type: "transcript", sessionID: session.id, text: "Que sais-tu faire ?", bargeIn: false, directory: DIRECTORY });
+
+  await until(() => h.msgs.some((m) => m.type === "heard" && m.decision === "superseded"), { label: "turn 1 superseded" });
+  await until(() => h.msgs.some((m) => m.type === "heard" && m.raw === "Que sais-tu faire ?" && m.decision === "reply"), { label: "turn 2 replied" });
+  await until(() => h.spoken().some((s) => s.text === "Voici la réponse directe."), { label: "turn 2 spoken" });
+
+  assert.equal(h.msgs.some((m) => m.type === "inject_done"), false, "superseded voice turn must NEVER trigger fallback injection");
+  assert.equal(h.spoken().some((s) => s.text.includes("obsolète")), false, "superseded voice turn must not speak");
+});

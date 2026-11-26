@@ -94,13 +94,15 @@ class CockpitApp {
     this.player = new VoicePlayer(
       { serverAvailable: () => this.serverVoice, lang: this.recognizerLang() },
       {
-        onStart: (utterance) => {
+        onStart: (utterance, resumed) => {
           this.speakingUtterance = utterance.id;
           this.lastSpokeAt = Date.now();
-          this.recentSpoken.push({ text: utterance.text, at: this.lastSpokeAt });
-          while (this.recentSpoken.length > 10) this.recentSpoken.shift();
+          if (!resumed) {
+            this.recentSpoken.push({ text: utterance.text, at: this.lastSpokeAt });
+            while (this.recentSpoken.length > 10) this.recentSpoken.shift();
+            this.ui.showSaying(utterance.text, utterance.id);
+          }
           this.mic?.setDucked(true);
-          this.ui.showSaying(utterance.text);
           this.ui.update({ state: "speaking" });
         },
         onEnd: (utterance, completed, heardText) => {
@@ -365,6 +367,9 @@ class CockpitApp {
         onLevel: (level) => this.ui.setLevel(level),
         onError: (err) => log.warn("microphone error", err),
         onLoopback: (active) => this.player.setLoopbackActive(active),
+        onUtteranceDiscarded: (confirmed) => {
+          if (confirmed && this.player.isPaused) this.scheduleFalseBargeResume(200);
+        },
       },
     );
     const micStart = this.mic.start().catch(() => {
@@ -415,17 +420,24 @@ class CockpitApp {
     if (this.falseBargeTimer) window.clearTimeout(this.falseBargeTimer);
     this.falseBargeTimer = window.setTimeout(() => {
       this.falseBargeTimer = undefined;
-      if (this.interruptedAt === 0) return;
+      if (this.interruptedAt === 0 && !this.player.isPaused) return;
       if (this.mic?.isSpeaking || this.pendingTranscripts.size > 0) {
-        this.scheduleFalseBargeResume(650);
+        this.scheduleFalseBargeResume(350);
         return;
       }
-      log.debug("false barge-in, resuming");
-      this.interruptedAt = 0;
-      this.link.send({ type: "barge_in_false", sessionID: this.sessionID });
-      this.player.resume();
-      this.ui.update({ state: "speaking" });
+      this.resumePlaybackNow();
     }, delayMs);
+  }
+
+  private resumePlaybackNow() {
+    if (this.falseBargeTimer) window.clearTimeout(this.falseBargeTimer);
+    this.falseBargeTimer = undefined;
+    log.debug("false barge-in, resuming");
+    this.interruptedAt = 0;
+    this.interruptedHeard = "";
+    this.link.send({ type: "barge_in_false", sessionID: this.sessionID });
+    this.player.resume();
+    this.ui.update({ state: this.player.isPlaying || this.player.pending > 0 ? "speaking" : "listening" });
   }
 
   private consumeBargeIn(): { bargeIn: boolean; spokenOver?: string } {
@@ -443,10 +455,11 @@ class CockpitApp {
     // barge-in timing; the transcript comes from the recognizer itself.
     if (!this.serverEars) return;
     const context = this.consumeBargeIn();
-    const bargeIn = context.bargeIn || meta.startedDuringPlayback;
+    const bargeIn = context.bargeIn || meta.startedDuringPlayback || this.player.isPaused;
     const controller = new AbortController();
     this.pendingTranscripts.add(controller);
     this.ui.update({ state: "thinking" });
+    let shouldCheckResume = false;
     try {
       const result = await postAudio(
         blob,
@@ -456,7 +469,7 @@ class CockpitApp {
       if (!result.text || result.decision === "echo" || result.decision === "quiet") {
         log.debug("stt utterance did not interrupt", { text: result.text?.slice(0, 60), decision: result.decision });
         if (!result.text) this.ui.showInterim("");
-        if (bargeIn && !this.mic?.isSpeaking && this.pendingTranscripts.size <= 1) this.player.resume();
+        shouldCheckResume = bargeIn || this.player.isPaused;
       }
     } catch (err) {
       if (!controller.signal.aborted) {
@@ -465,9 +478,18 @@ class CockpitApp {
         this.ui.update({ serverEars: false });
         // Fall back to the browser recognizer for the rest of the session.
         if (!this.recognizer && BrowserRecognizer.supported && this.live) await this.startBrowserRecognition();
+        shouldCheckResume = this.player.isPaused;
       }
     } finally {
       this.pendingTranscripts.delete(controller);
+      if (shouldCheckResume && this.player.isPaused) {
+        if (!this.mic?.isSpeaking && this.pendingTranscripts.size === 0) {
+          this.resumePlaybackNow();
+        } else {
+          if (!this.interruptedAt) this.interruptedAt = Date.now();
+          this.scheduleFalseBargeResume(350);
+        }
+      }
     }
   }
 

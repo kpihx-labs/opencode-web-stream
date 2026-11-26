@@ -32,6 +32,7 @@ export type MicEvents = {
   onLevel: (level: number) => void;
   onError: (error: unknown) => void;
   onLoopback?: (active: boolean) => void;
+  onUtteranceDiscarded?: (confirmed: boolean) => void;
 };
 
 export type MicOptions = {
@@ -132,16 +133,16 @@ export class Microphone {
     private readonly events: MicEvents,
   ) {
     this.opts = {
-      confirmMs: opts.confirmMs ?? 220,
-      duckedConfirmMs: opts.duckedConfirmMs ?? 220,
+      confirmMs: opts.confirmMs ?? 240,
+      duckedConfirmMs: opts.duckedConfirmMs ?? 320,
       hangoverMs: opts.hangoverMs ?? 550,
       prerollMs: opts.prerollMs ?? 400,
-      minUtteranceMs: opts.minUtteranceMs ?? 380,
+      minUtteranceMs: opts.minUtteranceMs ?? 280,
       maxUtteranceMs: opts.maxUtteranceMs ?? 0,
-      marginDb: opts.marginDb ?? 13,
-      holdMarginDb: opts.holdMarginDb ?? 8,
-      duckedMarginDb: opts.duckedMarginDb ?? 15,
-      duckedHoldMarginDb: opts.duckedHoldMarginDb ?? 9,
+      marginDb: opts.marginDb ?? 15,
+      holdMarginDb: opts.holdMarginDb ?? 10,
+      duckedMarginDb: opts.duckedMarginDb ?? 18,
+      duckedHoldMarginDb: opts.duckedHoldMarginDb ?? 11,
     };
     this.referenceStream = opts.referenceStream;
   }
@@ -160,14 +161,14 @@ export class Microphone {
     this.referenceStream = stream;
   }
 
-  /** Raise the bar slightly while the agent speaks (+450ms tail) without deafening barge-in. */
+  /** Raise the bar while the agent speaks (+750ms reverb tail) without deafening barge-in. */
   setDucked(ducked: boolean) {
     if (ducked) {
       this.ducked = true;
-      this.duckedUntil = Date.now() + 450;
+      this.duckedUntil = Date.now() + 750;
     } else {
       this.ducked = false;
-      this.duckedUntil = Date.now() + 450;
+      this.duckedUntil = Date.now() + 750;
     }
   }
 
@@ -345,14 +346,14 @@ export class Microphone {
     if (this.energies.length > FLOOR_WINDOW) this.energies.shift();
     const floor = noiseFloor(this.energies);
     const duckedNow = this.isDucked;
-    const duckMargin = this.loopbackEstablished ? this.opts.duckedMarginDb : Math.max(this.opts.duckedMarginDb, 22);
-    const duckHold = this.loopbackEstablished ? this.opts.duckedHoldMarginDb : Math.max(this.opts.duckedHoldMarginDb, 13);
+    const duckMargin = this.loopbackEstablished ? this.opts.duckedMarginDb : Math.max(this.opts.duckedMarginDb, 24);
+    const duckHold = this.loopbackEstablished ? this.opts.duckedHoldMarginDb : Math.max(this.opts.duckedHoldMarginDb, 14);
     const margin = this.speaking
       ? (duckedNow ? duckHold : this.opts.holdMarginDb)
       : (duckedNow ? duckMargin : this.opts.marginDb);
     const isVoice = db > floor + margin;
     const now = Date.now();
-    const confirmNeeded = duckedNow ? (this.loopbackEstablished ? this.opts.duckedConfirmMs : 340) : this.opts.confirmMs;
+    const confirmNeeded = duckedNow ? (this.loopbackEstablished ? this.opts.duckedConfirmMs : 400) : this.opts.confirmMs;
 
     if (isVoice) {
       this.lastVoiceAt = now;
@@ -386,8 +387,9 @@ export class Microphone {
     const pcmFrames = this.pcmChunks;
     this.pcmChunks = [];
     this.events.onSilence();
-    if (!wasConfirmed || durationMs < this.opts.minUtteranceMs || (pcmFrames.length === 0 && chunks.length === 0)) {
+    if ((pcmFrames.length === 0 && chunks.length === 0) || (!wasConfirmed && durationMs < this.opts.minUtteranceMs) || !wasConfirmed) {
       log.debug("utterance discarded", { durationMs, confirmed: wasConfirmed });
+      this.events.onUtteranceDiscarded?.(wasConfirmed);
       return;
     }
     if (this.useWorkletPcm && pcmFrames.length > 0 && this.context) {

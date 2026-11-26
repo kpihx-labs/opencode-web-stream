@@ -330,8 +330,10 @@ type WarmEdgeSocket = {
   openedAt: number;
 };
 
-let warmSlot: WarmEdgeSocket | undefined;
-let warmConnecting = false;
+const WARM_POOL_SIZE = 3;
+const WARM_MAX_AGE_MS = 28_000;
+const warmPool: WarmEdgeSocket[] = [];
+let warmMaintainerStarted = false;
 
 function buildEdgeUrl(): string {
   const connId = randomUUID().replace(/-/g, "");
@@ -370,60 +372,79 @@ function speechConfigMessage(): string {
   );
 }
 
-/** Pre-open a standby WebSocket with speech.config sent so the next TTS starts immediately. */
-export function prewarmEdgeTts(): void {
-  if (warmConnecting) return;
-  if (warmSlot && warmSlot.ws.readyState <= WebSocket.OPEN && Date.now() - warmSlot.openedAt < 35_000) return;
-  if (warmSlot) {
-    try {
-      warmSlot.ws.terminate();
-    } catch {
-      // ignore
-    }
-    warmSlot = undefined;
-  }
-  warmConnecting = true;
-  const ws = openEdgeSocket();
-  const entry: WarmEdgeSocket = { ws, ready: false, openedAt: Date.now() };
-  warmSlot = entry;
-  const drop = () => {
-    warmConnecting = false;
-    if (warmSlot === entry) warmSlot = undefined;
-  };
-  ws.once("open", () => {
-    warmConnecting = false;
-    if (warmSlot !== entry) {
+function pruneWarmPool() {
+  const now = Date.now();
+  for (let i = warmPool.length - 1; i >= 0; i--) {
+    const entry = warmPool[i];
+    const expired = now - entry.openedAt >= WARM_MAX_AGE_MS;
+    const dead = entry.ws.readyState > WebSocket.OPEN;
+    if (expired || dead) {
+      warmPool.splice(i, 1);
       try {
-        ws.terminate();
+        entry.ws.terminate();
       } catch {
         // ignore
       }
-      return;
     }
-    entry.ready = true;
-    entry.openedAt = Date.now();
-    try {
-      ws.send(speechConfigMessage());
-    } catch {
+  }
+}
+
+function fillWarmPool() {
+  pruneWarmPool();
+  while (warmPool.length < WARM_POOL_SIZE) {
+    const ws = openEdgeSocket();
+    const entry: WarmEdgeSocket = { ws, ready: false, openedAt: Date.now() };
+    warmPool.push(entry);
+    const drop = () => {
+      const idx = warmPool.indexOf(entry);
+      if (idx >= 0) warmPool.splice(idx, 1);
+    };
+    ws.once("open", () => {
+      if (!warmPool.includes(entry)) {
+        try {
+          ws.terminate();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      entry.ready = true;
+      entry.openedAt = Date.now();
+      try {
+        ws.send(speechConfigMessage());
+      } catch {
+        drop();
+      }
+    });
+    ws.once("unexpected-response", (_req, res) => {
+      if (res.statusCode === 403 && typeof res.headers.date === "string") adjustClockSkewFromDateHeader(res.headers.date);
       drop();
-    }
-  });
-  ws.once("unexpected-response", (_req, res) => {
-    if (res.statusCode === 403 && typeof res.headers.date === "string") adjustClockSkewFromDateHeader(res.headers.date);
-    drop();
-  });
-  ws.once("error", drop);
-  ws.once("close", drop);
+    });
+    ws.once("error", drop);
+    ws.once("close", drop);
+  }
+}
+
+/** Pre-open standby WebSockets with speech.config sent so burst sentences start immediately. */
+export function prewarmEdgeTts(): void {
+  fillWarmPool();
+  if (!warmMaintainerStarted) {
+    warmMaintainerStarted = true;
+    const timer = setInterval(() => {
+      if (warmPool.length > 0) fillWarmPool();
+    }, 22_000);
+    timer.unref?.();
+  }
 }
 
 function takeWarmEdgeSocket(): { ws: WebSocket; preconfigured: boolean } {
-  const entry = warmSlot;
-  if (entry && entry.ready && entry.ws.readyState === WebSocket.OPEN && Date.now() - entry.openedAt < 35_000) {
-    warmSlot = undefined;
+  pruneWarmPool();
+  const readyIdx = warmPool.findIndex((e) => e.ready && e.ws.readyState === WebSocket.OPEN);
+  if (readyIdx >= 0) {
+    const [entry] = warmPool.splice(readyIdx, 1);
     entry.ws.removeAllListeners("error");
     entry.ws.removeAllListeners("close");
     entry.ws.removeAllListeners("unexpected-response");
-    // Immediately replenish the standby socket for the next sentence.
     queueMicrotask(() => prewarmEdgeTts());
     return { ws: entry.ws, preconfigured: true };
   }

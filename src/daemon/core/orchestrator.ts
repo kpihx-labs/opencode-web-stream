@@ -933,16 +933,17 @@ export class Orchestrator {
     timeoutMs: number,
     speechKind: SpeechKind,
     expiresAt = 0,
-  ): Promise<{ decisions: Decision[]; spoke: boolean } | undefined> {
+  ): Promise<{ decisions: Decision[]; spoke: boolean; superseded?: boolean } | undefined> {
     if (!s.streamer) return undefined;
     const streamId = `str_${randomUUID().slice(0, 8)}`;
-    const speech = { reader: new IncrementalSpeechReader(), splitter: new SentenceSplitter(), streamId, seq: 0, kind: speechKind, spoke: false };
+    const speech = { reader: new IncrementalSpeechReader(), splitter: new SentenceSplitter({ locale: s.lang }), streamId, seq: 0, kind: speechKind, spoke: false };
     const result = await s.streamer.ask(kind, prompt, timeoutMs, () => {
       s.inflightSpeech = speech;
     });
     if (s.inflightSpeech === speech) s.inflightSpeech = undefined;
     if (!result || result.aborted) {
       if (speech.spoke) this.out.toSession(s.id, { type: "cancel", sessionID: s.id, streamId });
+      if (result?.superseded) return { decisions: [{ kind: "quiet" }], spoke: false, superseded: true };
       if (result?.timedOut) this.log.warn("streamer timed out", { kind, sessionID: s.id });
       return undefined;
     }
@@ -1238,6 +1239,10 @@ export class Orchestrator {
       this.scheduleInject(s, raw, "queue");
       this.out.toSession(s.id, { type: "heard", sessionID: s.id, raw, corrected: raw, decision: "inject:queue(fallback)" });
       return "inject:fallback";
+    }
+    if (res.superseded) {
+      this.out.toSession(s.id, { type: "heard", sessionID: s.id, raw, corrected: raw, decision: "superseded" });
+      return "superseded";
     }
     const hadClarify = Boolean(s.clarify);
     if (hadClarify && !res.decisions.some((d) => d.kind === "clarify")) s.clarify = undefined;

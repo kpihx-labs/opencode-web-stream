@@ -13,7 +13,7 @@ import type { Registry } from "./registry.js";
 
 export type AskKind = "beat" | "voice" | "blocked" | "digest" | "context";
 
-export type AskResult = { text: string; aborted: boolean; timedOut: boolean; streamerID: string };
+export type AskResult = { text: string; aborted: boolean; superseded?: boolean; timedOut: boolean; streamerID: string };
 
 type Job = {
   kind: AskKind;
@@ -157,7 +157,17 @@ export class StreamerSession {
         this.queue = this.queue.filter((j) => j.kind !== "beat");
         this.queue.push(job);
       } else {
-        // Voice and blocked events jump the queue and preempt a running beat.
+        // If a newer voice turn arrives while an earlier voice turn is waiting or stuck, supersede the stale turn.
+        if (kind === "voice") {
+          for (const old of this.queue.filter((j) => j.kind === "voice")) {
+            old.resolve({ text: "", aborted: true, superseded: true, timedOut: false, streamerID: "" });
+          }
+          this.queue = this.queue.filter((j) => j.kind !== "voice");
+          if (this.inflight?.job.kind === "voice") {
+            this.inflight.controller.abort(new Error("superseded"));
+          }
+        }
+        // Voice and blocked events jump the queue and preempt a running beat or digest.
         const idx = this.queue.findIndex((j) => j.kind === "beat");
         if (idx >= 0) this.queue.splice(idx, 0, job);
         else this.queue.push(job);
@@ -259,7 +269,7 @@ export class StreamerSession {
         if (reason) {
           // Stop the model on the server too; a preempted beat must not keep generating.
           this.client.abort(streamerID, this.directory).catch(() => undefined);
-          job.resolve({ text: "", aborted: true, timedOut: reason === "timeout", streamerID });
+          job.resolve({ text: "", aborted: true, superseded: reason === "superseded", timedOut: reason === "timeout", streamerID });
           this.log.debug("streamer request aborted", { kind: job.kind, reason });
         } else {
           this.log.warn("streamer request failed", { kind: job.kind, error: e instanceof Error ? e.message : String(e) });
