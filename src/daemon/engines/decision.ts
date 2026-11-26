@@ -110,15 +110,19 @@ export class DecisionEngine {
     ctx: { speaking: boolean; busy: boolean; hasScreenAnswer?: boolean },
   ): Promise<VoiceTriage> {
     if (!(await this.check())) return "pass";
+    const criteria: Record<string, string> = {
+      noise: "Meaningless filler, cough, breath, or non-communicative noise (e.g. euh, hmm, uh) not directed at the assistant.",
+      pass: "Any greeting, question, request, instruction, feedback, or meaningful speech directed at the assistant in any language.",
+    };
+    if (ctx.speaking) {
+      criteria.stop =
+        "The user is ONLY telling the currently speaking voice to stop talking, shut up, or pause, with no new task or question.";
+    }
     const questions: Record<string, unknown> = {
       intent: {
         type: "choice",
         instructions: "Classify the user voice utterance while using a live coding assistant.",
-        criteria: {
-          stop: "The user ONLY tells the voice/assistant to stop talking, shut up, pause, or be quiet (e.g. tais-toi, stop, arrete, shut up), with no coding instruction.",
-          noise: "Meaningless filler, cough, breath, garbled syllable (e.g. euh, hmm, uh) not meant as communication.",
-          pass: "A greeting, question, instruction, feedback, answer, or anything directed at the assistant (e.g. bonjour, ajoute un test, ok).",
-        },
+        criteria,
       },
     };
     if (ctx.hasScreenAnswer) {
@@ -139,17 +143,11 @@ export class DecisionEngine {
       return "pass";
     }
     const probs = ans.probabilities ?? {};
-    const wordCount = transcript.trim().split(/\s+/).filter(Boolean).length;
+    const passProb = probs.pass ?? 0;
     let decision: VoiceTriage = "pass";
-    if (
-      ctx.speaking &&
-      wordCount <= 5 &&
-      ans.choice === "stop" &&
-      (probs.stop ?? 0) >= 0.42 &&
-      (probs.stop ?? 0) - (probs.pass ?? 0) >= 0.1
-    ) {
+    if (ctx.speaking && ans.choice === "stop" && (probs.stop ?? 0) >= 0.5 && (probs.stop ?? 0) - passProb >= 0.12) {
       decision = "stop";
-    } else if (wordCount <= 2 && ans.choice === "noise" && (probs.noise ?? 0) >= 0.48) {
+    } else if (ans.choice === "noise" && (probs.noise ?? 0) >= 0.5 && (probs.noise ?? 0) - passProb >= 0.12) {
       decision = "noise";
     } else {
       const fromCtx = res?.answers?.from_context as NoulAnswer | undefined;
@@ -180,7 +178,7 @@ export class DecisionEngine {
     });
     const ans = res?.answers?.worth_speaking as NoulAnswer | undefined;
     if (!ans || ans.type !== "noul" || typeof ans.noul !== "number") return true;
-    const speak = ans.noul >= 0.4;
+    const speak = ans.noul >= 0.3;
     this.log.debug("largha beat triage", { speak, noul: ans.noul, elapsedMs: Date.now() - t0 });
     return speak;
   }

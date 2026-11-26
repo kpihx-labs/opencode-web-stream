@@ -132,15 +132,15 @@ export class Microphone {
   ) {
     this.opts = {
       confirmMs: opts.confirmMs ?? 220,
-      duckedConfirmMs: opts.duckedConfirmMs ?? 380,
+      duckedConfirmMs: opts.duckedConfirmMs ?? 450,
       hangoverMs: opts.hangoverMs ?? 550,
       prerollMs: opts.prerollMs ?? 400,
       minUtteranceMs: opts.minUtteranceMs ?? 380,
       maxUtteranceMs: opts.maxUtteranceMs ?? 30000,
       marginDb: opts.marginDb ?? 9,
       holdMarginDb: opts.holdMarginDb ?? 5,
-      duckedMarginDb: opts.duckedMarginDb ?? 24,
-      duckedHoldMarginDb: opts.duckedHoldMarginDb ?? 14,
+      duckedMarginDb: opts.duckedMarginDb ?? 26,
+      duckedHoldMarginDb: opts.duckedHoldMarginDb ?? 15,
     };
     this.referenceStream = opts.referenceStream;
   }
@@ -155,14 +155,14 @@ export class Microphone {
     this.referenceStream = stream;
   }
 
-  /** Raise the bar while the agent speaks (+650ms tail) so speaker echo never self-triggers. */
+  /** Raise the bar while the agent speaks (+900ms tail) so speaker echo never self-triggers. */
   setDucked(ducked: boolean) {
     if (ducked) {
       this.ducked = true;
-      this.duckedUntil = Date.now() + 650;
+      this.duckedUntil = Date.now() + 900;
     } else {
       this.ducked = false;
-      this.duckedUntil = Date.now() + 650;
+      this.duckedUntil = Date.now() + 900;
     }
   }
 

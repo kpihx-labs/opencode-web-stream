@@ -236,13 +236,8 @@ class CockpitApp {
     this.serverEars = stt.ready;
     this.sttEngine = stt.engine ?? (stt.ready ? "hex" : "browser");
     if (!this.live || prevEars === this.serverEars) return;
-    if (this.serverEars) {
-      if (this.recognizer) {
-        this.recognizer.stop();
-        this.recognizer = undefined;
-        log.info("switched to local server STT", { engine: this.sttEngine });
-      }
-    } else if (!this.recognizer && BrowserRecognizer.supported) {
+    log.info(this.serverEars ? "switched to local server STT" : "switched to browser STT", { engine: this.sttEngine });
+    if (!this.recognizer && BrowserRecognizer.supported) {
       void this.startBrowserRecognition();
     }
   }
@@ -357,13 +352,14 @@ class CockpitApp {
       { referenceStream: reference },
       {
         onSpeechStart: () => {
-          // Energy alone is not a decision; only duck the meter.
+          // Energy alone is not a decision; give immediate visual feedback when listening.
+          if (!this.player.isPlaying) this.ui.showInterim("🎤 …");
           this.ui.update({ state: this.player.isPlaying ? "speaking" : "listening" });
         },
         onSpeechConfirmed: () => this.onBargeIn(),
         onUtterance: (blob, meta) => void this.onUtterance(blob, meta),
         onSilence: () => {
-          this.recognizer?.commitInterim();
+          if (!this.serverEars) this.recognizer?.commitInterim();
           if (!this.player.isPlaying) this.ui.update({ state: "listening" });
         },
         onLevel: (level) => this.ui.setLevel(level),
@@ -374,16 +370,15 @@ class CockpitApp {
     const micStart = this.mic.start().catch(() => {
       this.mic = undefined;
     });
-    // Start browser recognition immediately without blocking on status or model preloads.
-    if (!this.serverEars && BrowserRecognizer.supported) {
-      this.recognizer = new BrowserRecognizer({
-        onFinal: (text) => void this.submitTranscript(text, this.consumeBargeIn()),
-        onInterim: (text) => this.ui.showInterim(text),
-        onError: (error) => log.debug("recognizer", error),
+    // Start browser recognition in parallel: authoritative in `stt:web` mode,
+    // and live real-time subtitle preview in `stt:hex` mode while Hex finalizes.
+    if (BrowserRecognizer.supported) {
+      this.startBrowserRecognitionSync();
+      log.info(this.serverEars ? "using daemon transcription + browser live interim" : "using browser recognition", {
+        lang: this.recognizerLang(),
+        biasing: this.recognizer?.supportsBiasing,
+        onDevice: this.recognizer?.supportsOnDevice,
       });
-      this.recognizer.setLang(this.recognizerLang());
-      this.recognizer.start();
-      log.info("using browser recognition", { lang: this.recognizerLang(), biasing: this.recognizer.supportsBiasing, onDevice: this.recognizer.supportsOnDevice });
     } else {
       log.info("using daemon transcription");
     }
@@ -452,6 +447,7 @@ class CockpitApp {
       );
       if (!result.text || result.decision === "echo" || result.decision === "quiet") {
         log.debug("stt utterance did not interrupt", { text: result.text?.slice(0, 60), decision: result.decision });
+        if (!result.text) this.ui.showInterim("");
         if (bargeIn) this.player.resume();
       }
     } catch (err) {
@@ -467,14 +463,27 @@ class CockpitApp {
     }
   }
 
-  private async startBrowserRecognition() {
+  private startBrowserRecognitionSync() {
+    if (this.recognizer) return;
     this.recognizer = new BrowserRecognizer({
-      onFinal: (text) => void this.submitTranscript(text, this.consumeBargeIn()),
-      onInterim: (text) => this.ui.showInterim(text),
+      onFinal: (text) => {
+        if (this.serverEars) {
+          if (!this.isSelfEcho(text)) this.ui.showInterim(text);
+          return;
+        }
+        void this.submitTranscript(text, this.consumeBargeIn());
+      },
+      onInterim: (text) => {
+        if (!this.isSelfEcho(text)) this.ui.showInterim(text);
+      },
       onError: (error) => log.debug("recognizer", error),
     });
     this.recognizer.setLang(this.recognizerLang());
     this.recognizer.start();
+  }
+
+  private async startBrowserRecognition() {
+    this.startBrowserRecognitionSync();
     log.info("switched to browser recognition", { lang: this.recognizerLang() });
   }
 
@@ -482,33 +491,36 @@ class CockpitApp {
     const now = Date.now();
     const activeWindow = this.player.isPlaying || now - this.lastSpokeAt <= 8000;
     if (!activeWindow && now - this.lastSpokeAt > 15000) return false;
-    const tokenize = (s: string) =>
+    const norm = (s: string) =>
       s
         .toLowerCase()
         .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .split(/[^a-z0-9]+/)
-        .filter((w) => w.length >= 2);
-    const words = tokenize(text);
-    if (words.length < 2) return false;
-    if (words.length < 4 && !activeWindow) return false;
+        .replace(/\p{M}+/gu, "")
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
+        .trim();
     const poolTexts = this.recentSpoken.filter((r) => now - r.at <= 25000).map((r) => r.text);
     if (spokenOver) poolTexts.push(spokenOver);
-    const poolWords = tokenize(poolTexts.join(" "));
+    if (!poolTexts.length) return false;
+    const normText = norm(text);
+    if (normText.length >= 12) {
+      for (const spoken of poolTexts) {
+        if (norm(spoken).includes(normText)) return true;
+      }
+    }
+    const words = normText.split(/\s+/).filter(Boolean);
+    if (words.length < 3) return false;
+    const poolWords = norm(poolTexts.join(" ")).split(/\s+/).filter(Boolean);
     const pool = new Set(poolWords);
-    if (pool.size < 2) return false;
+    if (pool.size < 3) return false;
     let hits = 0;
     for (const w of words) {
       if (pool.has(w)) {
         hits += 1;
-        continue;
-      }
-      if (w.length >= 4 && poolWords.some((sw) => sw.length >= 4 && (sw.startsWith(w.slice(0, 4)) || w.startsWith(sw.slice(0, 4))))) {
+      } else if (w.length >= 4 && poolWords.some((sw) => sw.length >= 4 && (sw.startsWith(w.slice(0, 4)) || w.startsWith(sw.slice(0, 4))))) {
         hits += 0.85;
       }
     }
-    const threshold = words.length <= 3 ? 0.65 : 0.55;
-    return hits / words.length >= threshold;
+    return hits / words.length >= 0.72;
   }
 
   private async submitTranscript(text: string, context: { bargeIn: boolean; spokenOver?: string }) {

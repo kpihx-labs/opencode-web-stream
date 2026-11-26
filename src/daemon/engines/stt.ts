@@ -182,11 +182,11 @@ export class SttEngine {
     await mkdir(dir, { recursive: true });
     const tmpPath = join(dir, `ows-stt-${randomUUID()}.${ext}`);
     await writeFile(tmpPath, audio);
+    const langRaw = opts.language ?? this.cfg.language;
+    const lang = langRaw && langRaw !== "auto" ? langRaw.toLowerCase().split(/[-_]/)[0] : "";
     try {
       const model = this.cfg.model || "orukeet";
       const args = ["transcribe", tmpPath, "--model", model, "--json"];
-      const langRaw = opts.language ?? this.cfg.language;
-      const lang = langRaw && langRaw !== "auto" ? langRaw.toLowerCase().split(/[-_]/)[0] : "";
       if (lang && model !== "orukeet") args.push("--language", lang);
       const { stdout } = await execFile(this.cfg.binary || "hex", args, {
         timeout: this.cfg.timeoutMs,
@@ -204,6 +204,19 @@ export class SttEngine {
       return { text, language: lang || undefined };
     } catch (e) {
       const errObj = e as { message?: string; stdout?: string; stderr?: string };
+      // Ambient silence / non-speech clips return exit 1 with code:"no-speech": treat as empty transcript, NOT engine crash!
+      if (typeof errObj?.stdout === "string" && errObj.stdout.trim().startsWith("{")) {
+        try {
+          const parsedErr = JSON.parse(errObj.stdout) as { code?: string };
+          if (parsedErr.code === "no-speech") {
+            this.ready = true;
+            this.log.debug("hex stt no speech", { bytes: audio.length, elapsedMs: Date.now() - t0 });
+            return { text: "", language: lang || undefined };
+          }
+        } catch {
+          // fall through to warn/throw
+        }
+      }
       this.log.warn("hex stt failed", {
         elapsedMs: Date.now() - t0,
         bytes: audio.length,

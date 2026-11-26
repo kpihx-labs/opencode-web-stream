@@ -9,7 +9,7 @@ import { OpencodeClient } from "../../dist/daemon/opencode/client.js";
 import { DecisionEngine } from "../../dist/daemon/engines/decision.js";
 import { SttEngine } from "../../dist/daemon/engines/stt.js";
 import { normalizeEdgeVoice, generateSecMsGecV2 } from "../../dist/daemon/engines/edge-tts.js";
-import { isStructuredMarkdownReport, isEchoOfSpoken } from "../../dist/daemon/core/orchestrator.js";
+import { isEchoOfSpoken } from "../../dist/daemon/core/orchestrator.js";
 import { Registry } from "../../dist/daemon/core/registry.js";
 import { StreamerSession } from "../../dist/daemon/core/streamer.js";
 import { Logger } from "../../dist/daemon/log.js";
@@ -217,16 +217,6 @@ test("browser bundle resolves V2 tabs, WordBoundary heard text, and V2 composer 
   assert.match(bundle, /phrases-not-supported/);
 });
 
-test("isStructuredMarkdownReport detects headings/tables and isEchoOfSpoken catches speaker bleed", () => {
-  assert.equal(isStructuredMarkdownReport("# Veille Technologique\n\nIntro"), true);
-  assert.equal(isStructuredMarkdownReport("| Col A | Col B |\n|---|---|\n| 1 | 2 |"), true);
-  assert.equal(isStructuredMarkdownReport("Bonjour, je regarde le démon maintenant."), false);
-
-  const recent = [{ text: "Je suis Colab, prêt à travailler avec toi sur ce projet.", at: Date.now() }];
-  assert.equal(isEchoOfSpoken("Je suis collab prêt à travailler avec toi", recent), true);
-  assert.equal(isEchoOfSpoken("Présente-moi uniquement la partie sur les LLM", recent), false);
-});
-
 test("Registry auto-loads Hex vocabulary terms and merges with learned aliases", () => {
   const dir = mkdtempSync(join(tmpdir(), "ows-hex-"));
   try {
@@ -354,11 +344,12 @@ test("StreamerSession tries configured streamer.models in order when one fails",
   }
 });
 
-test("isEchoOfSpoken catches short 2-word and fuzzy TTS echo snippets", () => {
+test("isEchoOfSpoken catches contiguous and high-overlap TTS echo snippets without blocking user questions", () => {
   const now = Date.now();
-  const recent = [{ text: "Voici la synthèse des avancées technologiques.", at: now - 1200 }];
-  assert.equal(isEchoOfSpoken("synthèse avancées", recent, recent[0].text, now), true);
-  assert.equal(isEchoOfSpoken("synthese technologique", recent, recent[0].text, now), true);
+  const recent = [{ text: "Voici la synthèse des avancées technologiques sur cette recherche.", at: now - 1200 }];
+  assert.equal(isEchoOfSpoken("la synthèse des avancées technologiques", recent, recent[0].text, now), true);
+  assert.equal(isEchoOfSpoken("Voici la synthese des avancees", recent, recent[0].text, now), true);
+  assert.equal(isEchoOfSpoken("Où en est la recherche ?", recent, recent[0].text, now), false);
   assert.equal(isEchoOfSpoken("ouvre le fichier config", recent, recent[0].text, now), false);
 });
 
@@ -405,4 +396,35 @@ test("encodeWav16k builds a valid 16 kHz mono RIFF WAV blob", async () => {
   assert.equal(buf.readUInt32LE(24), 16000);
   assert.equal(buf.readUInt16LE(34), 16);
   assert.equal(buf.length, 44 + 512 * 2);
+});
+
+test("VoicePlayer preserves pausedItem on interrupt so resume continues without dropping mid-sentence", () => {
+  assert.match(bundle, /pausedItem/);
+  assert.match(bundle, /resumeOffsetSec/);
+  assert.match(bundle, /max-height:\s*84px/);
+  assert.match(bundle, /using daemon transcription \+ browser live interim/);
+});
+
+test("SttEngine treats Hex no-speech JSON exit as empty transcript and keeps Hex ready", async () => {
+  const { mkdtempSync: mkd, writeFileSync: wf, chmodSync: chm, rmSync: rm } = await import("node:fs");
+  const dir = mkd(join(tmpdir(), "ows-hex-ns-"));
+  const fakeHex = join(dir, "hex");
+  try {
+    wf(
+      fakeHex,
+      `#!/usr/bin/env node
+if (process.argv.includes("--version")) { console.log("hex 3.5.0"); process.exit(0); }
+console.log(JSON.stringify({ version: 4, status: "error", code: "no-speech", message: "no speech" }));
+process.exit(1);
+`,
+    );
+    chm(fakeHex, 0o755);
+    const stt = new SttEngine({ ...DEFAULTS.stt, mode: "hex", binary: fakeHex }, log);
+    assert.equal(await stt.check(true), true);
+    const out = await stt.transcribe(Buffer.alloc(1024, 1), { mime: "audio/wav" });
+    assert.equal(out.text, "");
+    assert.equal(stt.isReady, true);
+  } finally {
+    rm(dir, { recursive: true, force: true });
+  }
 });

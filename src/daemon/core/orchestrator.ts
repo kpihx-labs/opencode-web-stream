@@ -10,7 +10,7 @@ import type {
   ToolPart,
 } from "../../shared/opencode-events.js";
 import { isTextPart, isToolPart } from "../../shared/opencode-events.js";
-import type { ControlAction, LiveState, ServerMessage, SessionSnapshot, SpeechKind, Utterance } from "../../shared/protocol.js";
+import { MAX_UTTERANCE_CHARS, type ControlAction, type LiveState, type ServerMessage, type SessionSnapshot, type SpeechKind, type Utterance } from "../../shared/protocol.js";
 import { phrase, pickLang } from "../../shared/phrases.js";
 import { shortLang, type Config } from "../config.js";
 import type { Logger, ScopedLogger } from "../log.js";
@@ -509,7 +509,7 @@ export class Orchestrator {
           const s = this.sessions.get(sessionID);
           if (s && this.root(s).live) {
             const r = this.root(s);
-            this.enqueueSpeech(r, "system", this.cfg.answer.codeNotice ? "Je condense ma mémoire, je continue." : "", 0);
+            void this.askSystem(r, "session_compacted");
             void this.reseed(r);
           }
           return;
@@ -771,15 +771,6 @@ export class Orchestrator {
     stream.fullText += delta;
     const trimmed = stream.fullText.trim();
     if (trimmed) s.lastAnswer = trimmed;
-    if (!stream.suppressed && isStructuredMarkdownReport(trimmed)) {
-      // Never read Markdown titles, tables or structured reports literally: let
-      // finishAnswer present the findings conversationally via askDigest.
-      stream.suppressed = true;
-      if (stream.spokenSentences > 0) {
-        this.out.toSession(s.id, { type: "cancel", sessionID: s.id, streamId: stream.streamId });
-      }
-      return;
-    }
     if (stream.suppressed) return;
     for (const sentence of stream.splitter.feed(delta)) this.emitAnswerSentence(s, stream, sentence, false);
   }
@@ -920,11 +911,19 @@ export class Orchestrator {
     if (!s.streamer) return;
     const res = await this.askStreamer(s, "blocked", prompt, this.cfg.streamer.voiceTimeoutMs, "blocked");
     if (!res) {
-      // Streamer unavailable: the user must still hear that they are needed.
-      if (s.pending) this.enqueueSpeech(s, "blocked", `J'attends ta réponse. ${this.pendingSummary(s.pending)}`, 0);
+      this.out.toSession(s.id, { type: "error", message: this.pendingSummary(s.pending!) || "blocked" });
       return;
     }
     this.applyDecisions(s, res.decisions, { spoke: res.spoke, source: "blocked" });
+  }
+
+  /** Ask the streamer LLM to phrase a brief system notice dynamically in the user's current language. */
+  private async askSystem(s: Session, event: string, detail?: string) {
+    if (!s.streamer || !s.live) return;
+    const prompt = `[SYSTEM]\nevent: ${event}\nlanguage: ${s.lang}${detail ? `\ndetail: ${excerpt(detail, 200)}` : ""}`;
+    const res = await this.askStreamer(s, "digest", prompt, this.cfg.streamer.beatTimeoutMs, "system");
+    if (!res) return;
+    this.applyDecisions(s, res.decisions, { spoke: res.spoke, source: "digest" });
   }
 
   // ---- streamer plumbing ---------------------------------------------------
@@ -1014,7 +1013,26 @@ export class Orchestrator {
         case "reply":
         case "clarify": {
           label(d.kind, d.kind === "clarify" ? 2 : 1);
-          if (!ctx.spoke) this.enqueueSpeech(s, d.kind === "say" && ctx.source === "beat" ? "beat" : ctx.source === "blocked" ? "blocked" : "reply", d.text, ctx.expiresAt ?? 0);
+          if (!ctx.spoke) {
+            const speechKind: SpeechKind = d.kind === "say" && ctx.source === "beat" ? "beat" : ctx.source === "blocked" ? "blocked" : "reply";
+            const splitter = new SentenceSplitter({
+              locale: s.lang,
+              codeNotice: this.cfg.answer.codeNotice,
+              tableNotice: this.cfg.answer.tableNotice,
+              maxChars: MAX_UTTERANCE_CHARS,
+            });
+            const parts = [...splitter.feed(d.text), ...splitter.flush()];
+            const streamId = parts.length > 1 ? `dec_${randomUUID().slice(0, 8)}` : undefined;
+            parts.forEach((part, idx) => {
+              this.enqueueSpeech(
+                s,
+                speechKind,
+                part,
+                ctx.expiresAt ?? 0,
+                streamId ? { streamId, streamSeq: idx, streamEnd: idx === parts.length - 1 } : undefined,
+              );
+            });
+          }
           if (d.kind === "clarify") {
             s.clarify = { question: d.text, transcript: ctx.transcript ?? "", at: Date.now() };
             this.setPhase(s, "waiting_user");
@@ -1314,7 +1332,7 @@ export class Orchestrator {
       const msg = e instanceof Error ? e.message : String(e);
       this.log.error("inject failed", { sessionID: s.id, error: msg });
       this.out.toSession(s.id, { type: "inject_done", sessionID: s.id, injectId: id, ok: false, error: msg });
-      this.enqueueSpeech(s, "system", "Je n'ai pas réussi à transmettre ta consigne, réessaie.", 0);
+      void this.askSystem(s, "inject_failed", msg);
     }
   }
 
@@ -1333,22 +1351,23 @@ export class Orchestrator {
   private async answerPermission(s: Session, answer: "once" | "always" | "reject") {
     const p = s.pending;
     if (p?.kind !== "permission") {
-      this.enqueueSpeech(s, "system", "Il n'y a plus de permission en attente.", 0);
+      void this.askSystem(s, "no_pending_permission");
       return;
     }
     try {
       await this.client.respondPermission(s.id, s.directory, p.req.id, answer);
       this.clearPending(s);
     } catch (e) {
-      this.log.error("permission reply failed", { error: e instanceof Error ? e.message : String(e) });
-      this.enqueueSpeech(s, "system", "Je n'ai pas réussi à répondre à la permission.", 0);
+      const msg = e instanceof Error ? e.message : String(e);
+      this.log.error("permission reply failed", { error: msg });
+      void this.askSystem(s, "permission_reply_failed", msg);
     }
   }
 
   private async answerQuestion(s: Session, answers: string[][]) {
     const p = s.pending;
     if (p?.kind !== "question") {
-      this.enqueueSpeech(s, "system", "Il n'y a plus de question en attente.", 0);
+      void this.askSystem(s, "no_pending_question");
       return;
     }
     try {
@@ -1360,8 +1379,9 @@ export class Orchestrator {
       await this.client.replyQuestion(s.directory, p.req.id, mapped, s.id);
       this.clearPending(s);
     } catch (e) {
-      this.log.error("question reply failed", { error: e instanceof Error ? e.message : String(e) });
-      this.enqueueSpeech(s, "system", "Je n'ai pas réussi à transmettre ta réponse.", 0);
+      const msg = e instanceof Error ? e.message : String(e);
+      this.log.error("question reply failed", { error: msg });
+      void this.askSystem(s, "question_reply_failed", msg);
     }
   }
 
@@ -1457,19 +1477,10 @@ export function sessionUrl(directory: string, sessionID: string): string {
   return `/${Buffer.from(directory, "utf8").toString("base64")}/session/${encodeURIComponent(sessionID)}`;
 }
 
-/** True when a streamed answer is a structured Markdown report (headings, tables, code) that should be presented conversationally rather than read literally. */
-export function isStructuredMarkdownReport(text: string): boolean {
-  if (/^#{1,6}\s+\S/m.test(text)) return true;
-  if (/^\|.+\|\s*$/m.test(text)) return true;
-  if (/^```/m.test(text)) return true;
-  if ((text.match(/^[-*]\s+\S/gm)?.length ?? 0) >= 4) return true;
-  return false;
-}
-
 /**
- * Detect when the microphone transcribed the agent's own TTS voice bleeding
- * from the speakers. Catches short snippets (2+ words within active window)
- * and slight STT mishearings via normalized prefix/token overlap.
+ * Language-agnostic echo check: compares Unicode-normalized contiguous spans and
+ * high token overlap against recently spoken TTS utterances. No language-specific
+ * stopword lists.
  */
 export function isEchoOfSpoken(
   transcript: string,
@@ -1477,29 +1488,29 @@ export function isEchoOfSpoken(
   lastSpoken?: string,
   now = Date.now(),
 ): boolean {
-  const words = tokenizeEchoWords(transcript);
-  if (words.length < 2) return false;
-  const recentActive = recentSpoken.filter((r) => now - r.at <= 25000);
-  const veryRecent = recentSpoken.some((r) => now - r.at <= 8000);
-  if (words.length < 4 && !veryRecent && !lastSpoken) return false;
-  const recentTexts = recentActive.map((r) => r.text);
+  const recentTexts = recentSpoken.filter((r) => now - r.at <= 25000).map((r) => r.text);
   if (lastSpoken) recentTexts.push(lastSpoken);
   if (!recentTexts.length) return false;
+  const normTranscript = normalizeEchoText(transcript);
+  if (normTranscript.length >= 12) {
+    for (const spoken of recentTexts) {
+      if (normalizeEchoText(spoken).includes(normTranscript)) return true;
+    }
+  }
+  const words = tokenizeEchoWords(transcript);
+  if (words.length < 3) return false;
   const spokenWords = tokenizeEchoWords(recentTexts.join(" "));
   const spokenPool = new Set(spokenWords);
-  if (spokenPool.size < 2) return false;
+  if (spokenPool.size < 3) return false;
   let hits = 0;
   for (const w of words) {
     if (spokenPool.has(w)) {
       hits += 1;
-      continue;
-    }
-    if (w.length >= 4 && spokenWords.some((sw) => sw.length >= 4 && (sw.startsWith(w.slice(0, 4)) || w.startsWith(sw.slice(0, 4))))) {
+    } else if (w.length >= 4 && spokenWords.some((sw) => sw.length >= 4 && (sw.startsWith(w.slice(0, 4)) || w.startsWith(sw.slice(0, 4))))) {
       hits += 0.85;
     }
   }
-  const threshold = words.length <= 3 ? 0.65 : 0.55;
-  return hits / words.length >= threshold;
+  return hits / words.length >= 0.72;
 }
 
 /** Strip residual Markdown/formatting from spoken replies so TTS never reads asterisks or hashes aloud. */
@@ -1513,11 +1524,17 @@ export function cleanSpokenText(text: string): string {
     .trim();
 }
 
-function tokenizeEchoWords(text: string): string[] {
+function normalizeEchoText(text: string): string {
   return text
     .toLowerCase()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .split(/[^a-z0-9]+/)
-    .filter((w) => w.length >= 2);
+    .replace(/\p{M}+/gu, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+function tokenizeEchoWords(text: string): string[] {
+  return normalizeEchoText(text)
+    .split(/\s+/)
+    .filter(Boolean);
 }

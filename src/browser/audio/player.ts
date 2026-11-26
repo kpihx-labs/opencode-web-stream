@@ -32,6 +32,10 @@ type QueueItem = {
   enqueuedAt: number;
   /** Prefetched audio, when synthesis ran ahead of playback. */
   audio?: Promise<TtsPayload | undefined>;
+  /** Set when resuming a paused buffer mid-utterance after a false barge-in. */
+  decodedBuffer?: AudioBuffer;
+  boundaries?: TtsBoundary[];
+  resumeOffsetSec?: number;
 };
 
 export type PlayerOptions = {
@@ -43,7 +47,8 @@ export type PlayerOptions = {
 
 export class VoicePlayer {
   private queue: QueueItem[] = [];
-  private current?: { item: QueueItem; startedAt: number; stop: (completed: boolean) => void };
+  private current?: { item: QueueItem; startedAt: number; stop: (completed: boolean, pause?: boolean) => void };
+  private pausedItem?: QueueItem;
   private context?: AudioContext;
   private destination?: MediaStreamAudioDestinationNode;
   private gain?: GainNode;
@@ -215,28 +220,41 @@ export class VoicePlayer {
   }
 
   private async play(item: QueueItem): Promise<void> {
+    if (item.decodedBuffer && this.context) {
+      await this.playBuffer(item, item.decodedBuffer, item.boundaries);
+      return;
+    }
     const payload = this.opts.serverAvailable()
       ? await (item.audio ?? postTts(item.utterance.text, item.utterance.lang).catch(() => undefined))
       : undefined;
+    if (this.paused) {
+      this.pausedItem = item;
+      return;
+    }
     if (payload?.blob && this.context) {
-      await this.playBuffer(item, payload.blob, payload.boundaries);
+      let buffer: AudioBuffer;
+      try {
+        buffer = await this.context.decodeAudioData(await payload.blob.arrayBuffer());
+      } catch (err) {
+        log.warn("decode failed, falling back to browser voice", err);
+        await this.playSpeechSynthesis(item);
+        return;
+      }
+      if (this.paused) {
+        this.pausedItem = { ...item, decodedBuffer: buffer, boundaries: payload.boundaries };
+        return;
+      }
+      await this.playBuffer(item, buffer, payload.boundaries);
       return;
     }
     await this.playSpeechSynthesis(item);
   }
 
-  private async playBuffer(item: QueueItem, blob: Blob, boundaries?: TtsBoundary[]): Promise<void> {
+  private async playBuffer(item: QueueItem, buffer: AudioBuffer, boundaries?: TtsBoundary[]): Promise<void> {
     const context = this.context!;
-    let buffer: AudioBuffer;
-    try {
-      buffer = await context.decodeAudioData(await blob.arrayBuffer());
-    } catch (err) {
-      log.warn("decode failed, falling back to browser voice", err);
-      await this.playSpeechSynthesis(item);
-      return;
-    }
     if (context.state === "suspended") await context.resume().catch(() => undefined);
     if (this.gain) this.gain.gain.setValueAtTime(1, context.currentTime);
+    const baseOffsetSec = Math.max(0, Math.min(item.resumeOffsetSec ?? 0, Math.max(0, buffer.duration - 0.1)));
     await new Promise<void>((resolve) => {
       const source = context.createBufferSource();
       source.buffer = buffer;
@@ -244,12 +262,22 @@ export class VoicePlayer {
       source.connect(this.gain!);
       const startedAt = context.currentTime;
       let settled = false;
-      const finish = (completed: boolean) => {
+      const finish = (completed: boolean, pause = false) => {
         if (settled) return;
         settled = true;
-        const elapsedSec = Math.max(0, context.currentTime - startedAt);
-        const fraction = buffer.duration > 0 ? Math.min(1, (elapsedSec * this.rate) / buffer.duration) : 1;
-        const exactHeard = !completed && boundaries?.length ? heardFromBoundaries(boundaries, elapsedSec * 1000 * this.rate) : undefined;
+        const playedSec = Math.max(0, context.currentTime - startedAt) * this.rate;
+        const totalOffsetSec = baseOffsetSec + playedSec;
+        if (pause && !completed) {
+          // Keep exact decoded buffer + position (minus 150ms overlap) so resume() picks up seamlessly.
+          this.pausedItem = {
+            ...item,
+            decodedBuffer: buffer,
+            boundaries,
+            resumeOffsetSec: Math.max(0, totalOffsetSec - 0.15),
+          };
+        }
+        const fraction = buffer.duration > 0 ? Math.min(1, totalOffsetSec / buffer.duration) : 1;
+        const exactHeard = !completed && boundaries?.length ? heardFromBoundaries(boundaries, totalOffsetSec * 1000) : undefined;
         this.current = undefined;
         this.finishItem(item, completed, fraction, exactHeard);
         resolve();
@@ -258,7 +286,7 @@ export class VoicePlayer {
       this.current = {
         item,
         startedAt: Date.now(),
-        stop: (completed) => {
+        stop: (completed, pause = false) => {
           // Instant playout drain: silence gain before stopping source so cut-off is <5ms.
           try {
             if (!completed && this.gain) this.gain.gain.setValueAtTime(0, context.currentTime);
@@ -267,12 +295,12 @@ export class VoicePlayer {
           } catch {
             // already stopped
           }
-          finish(completed);
+          finish(completed, pause);
         },
       };
       try {
         this.events.onStart(item.utterance);
-        source.start();
+        source.start(0, baseOffsetSec);
       } catch (err) {
         log.warn("audio start failed", err);
         finish(false);
@@ -364,16 +392,26 @@ export class VoicePlayer {
    */
   interrupt(): string {
     const playing = this.current;
-    if (!playing) return this.lastCompleted?.text ?? "";
+    if (!playing) {
+      this.paused = true;
+      return this.lastCompleted?.text ?? "";
+    }
     const utterance = playing.item.utterance;
-    playing.stop(false);
     this.paused = true;
+    playing.stop(false, true);
     return utterance.text;
   }
 
   /** Continue after a barge-in that led nowhere. */
   resume() {
     this.paused = false;
+    if (this.pausedItem) {
+      const item = this.pausedItem;
+      this.pausedItem = undefined;
+      if (!item.utterance.streamId || !this.deadStreams.has(item.utterance.streamId)) {
+        this.queue.unshift(item);
+      }
+    }
     void this.pump();
   }
 
@@ -382,15 +420,19 @@ export class VoicePlayer {
     if (opts.streamId) {
       this.deadStreams.add(opts.streamId);
       if (this.deadStreams.size > 50) this.deadStreams.delete(this.deadStreams.values().next().value as string);
+      if (this.pausedItem?.utterance.streamId === opts.streamId) this.pausedItem = undefined;
       this.queue = this.queue.filter((item) => item.utterance.streamId !== opts.streamId);
       if (this.current?.item.utterance.streamId === opts.streamId) this.current.stop(false);
     } else if (opts.utteranceId) {
+      if (this.pausedItem?.utterance.id === opts.utteranceId) this.pausedItem = undefined;
       this.queue = this.queue.filter((item) => item.utterance.id !== opts.utteranceId);
       if (this.current?.item.utterance.id === opts.utteranceId) this.current.stop(false);
     } else if (opts.kind) {
+      if (this.pausedItem?.utterance.kind === opts.kind) this.pausedItem = undefined;
       this.queue = this.queue.filter((item) => item.utterance.kind !== opts.kind);
       if (this.current?.item.utterance.kind === opts.kind) this.current.stop(false);
     } else {
+      this.pausedItem = undefined;
       this.queue = [];
       this.current?.stop(false);
     }
