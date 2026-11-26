@@ -124,7 +124,11 @@ test("going live creates a streamer session, seeds it, and nothing more", async 
   assert.notEqual(streamerID, session.id, "the streamer must be its own session");
   const seed = h.opencode.prompts.find((p) => p.body.noReply);
   assert.equal(seed.body.agent, "streamer");
-  assert.equal(seed.body.model.providerID, DEFAULTS.streamer.model.split("/")[0]);
+  if (DEFAULTS.streamer.model) {
+    assert.equal(seed.body.model.providerID, DEFAULTS.streamer.model.split("/")[0]);
+  } else {
+    assert.equal(seed.body.model, undefined, "empty streamer.model inherits the main session's active model");
+  }
   assert.match(seed.body.parts[0].text, /^\[CONTEXT\]/);
   assert.match(seed.body.parts[0].text, /fix the proxy/);
   // Seeding must not make the model talk.

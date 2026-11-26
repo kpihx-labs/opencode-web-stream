@@ -1,4 +1,4 @@
-import { SPEECH_PRIORITY, type Utterance } from "../../shared/protocol.js";
+import { SPEECH_PRIORITY, type SpeechKind, type Utterance } from "../../shared/protocol.js";
 import { log } from "../log.js";
 import { postTts, type TtsBoundary, type TtsPayload } from "../net.js";
 
@@ -47,6 +47,8 @@ export class VoicePlayer {
   private context?: AudioContext;
   private destination?: MediaStreamAudioDestinationNode;
   private gain?: GainNode;
+  private directConnected = false;
+  private loopbackActive = false;
   private playing = false;
   private paused = false;
   private rate: number;
@@ -75,8 +77,11 @@ export class VoicePlayer {
       this.context = new Ctor();
       this.gain = this.context.createGain();
       this.destination = this.context.createMediaStreamDestination();
-      this.gain.connect(this.context.destination);
       this.gain.connect(this.destination);
+      if (!this.loopbackActive) {
+        this.gain.connect(this.context.destination);
+        this.directConnected = true;
+      }
     }
     if (this.context.state === "suspended") await this.context.resume().catch(() => undefined);
     // A near-silent utterance satisfies the browser's gesture requirement.
@@ -90,6 +95,30 @@ export class VoicePlayer {
       }
     }
     return this.destination?.stream;
+  }
+
+  /**
+   * When the WebRTC loopback plays `destination.stream` via `<audio>`,
+   * disconnect direct `context.destination` so audio never plays twice (echo).
+   */
+  setLoopbackActive(active: boolean) {
+    this.loopbackActive = active;
+    if (!this.gain || !this.context) return;
+    if (active && this.directConnected) {
+      try {
+        this.gain.disconnect(this.context.destination);
+      } catch {
+        // already disconnected
+      }
+      this.directConnected = false;
+    } else if (!active && !this.directConnected) {
+      try {
+        this.gain.connect(this.context.destination);
+        this.directConnected = true;
+      } catch {
+        // ignore
+      }
+    }
   }
 
   setRate(rate: number) {
@@ -144,7 +173,7 @@ export class VoicePlayer {
       if (item.audio) continue;
       item.audio = postTts(item.utterance.text, item.utterance.lang)
         .catch((err) => {
-          log.warn("tts prefetch failed", err);
+          log.warn("tts prefetch failed", err instanceof Error ? err.message : String(err));
           return undefined;
         });
     }
@@ -348,7 +377,7 @@ export class VoicePlayer {
   }
 
   /** Drop pending speech. With no argument, everything. */
-  cancel(opts: { utteranceId?: string; streamId?: string } = {}) {
+  cancel(opts: { utteranceId?: string; streamId?: string; kind?: SpeechKind } = {}) {
     if (opts.streamId) {
       this.deadStreams.add(opts.streamId);
       if (this.deadStreams.size > 50) this.deadStreams.delete(this.deadStreams.values().next().value as string);
@@ -357,6 +386,9 @@ export class VoicePlayer {
     } else if (opts.utteranceId) {
       this.queue = this.queue.filter((item) => item.utterance.id !== opts.utteranceId);
       if (this.current?.item.utterance.id === opts.utteranceId) this.current.stop(false);
+    } else if (opts.kind) {
+      this.queue = this.queue.filter((item) => item.utterance.kind !== opts.kind);
+      if (this.current?.item.utterance.kind === opts.kind) this.current.stop(false);
     } else {
       this.queue = [];
       this.current?.stop(false);

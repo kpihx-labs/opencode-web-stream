@@ -546,7 +546,7 @@ export class OpencodeClient {
       case "session.text.started": {
         const sessionID = String(data.sessionID ?? "");
         const messageID = String(data.assistantMessageID ?? "");
-        const partID = `${messageID}:${data.ordinal ?? 0}`;
+        const partID = `${messageID}:text`;
         const key = `${sessionID}:${partID}`;
         if (!this.v2TextBuffers.has(key)) this.v2TextBuffers.set(key, "");
         emit("message.part.updated", { part: { id: partID, sessionID, messageID, type: "text", text: this.v2TextBuffers.get(key) ?? "" } });
@@ -557,7 +557,7 @@ export class OpencodeClient {
         const messageID = String(data.assistantMessageID ?? "");
         const delta = typeof data.delta === "string" ? data.delta : "";
         if (!delta) break;
-        const partID = `${messageID}:${data.ordinal ?? 0}`;
+        const partID = `${messageID}:text`;
         const key = `${sessionID}:${partID}`;
         const next = (this.v2TextBuffers.get(key) ?? "") + delta;
         this.v2TextBuffers.set(key, next);
@@ -570,7 +570,7 @@ export class OpencodeClient {
         const sessionID = String(data.sessionID ?? "");
         const messageID = String(data.assistantMessageID ?? "");
         const text = typeof data.text === "string" ? data.text : "";
-        const partID = `${messageID}:${data.ordinal ?? 0}`;
+        const partID = `${messageID}:text`;
         const key = `${sessionID}:${partID}`;
         const prev = this.v2TextSeen.get(key) ?? 0;
         this.v2TextBuffers.set(key, text);
@@ -586,22 +586,27 @@ export class OpencodeClient {
         const sessionID = String(data.sessionID ?? "");
         const messageID = String(data.messageID ?? "");
         const content = Array.isArray(data.content) ? (data.content as Array<Record<string, unknown>>) : [];
+        const textChunks: string[] = [];
         content.forEach((item, idx) => {
-          const partID = `${messageID}:${idx}`;
           if (item.type === "text" && typeof item.text === "string") {
-            const key = `${sessionID}:${partID}`;
-            const prev = this.v2TextSeen.get(key) ?? 0;
-            this.v2TextBuffers.set(key, item.text);
-            emit("message.part.updated", { part: { id: partID, sessionID, messageID, type: "text", text: item.text } });
-            if (item.text.length > prev) {
-              const delta = item.text.slice(prev);
-              this.v2TextSeen.set(key, item.text.length);
-              emit("message.part.delta", { sessionID, messageID, partID, field: "text", delta });
-            }
+            textChunks.push(item.text);
           } else if (item.type === "tool") {
             emit("message.part.updated", { part: normalizeV2Tool(item, sessionID, messageID, idx) });
           }
         });
+        if (textChunks.length > 0) {
+          const fullText = textChunks.join("\n");
+          const partID = `${messageID}:text`;
+          const key = `${sessionID}:${partID}`;
+          const prev = this.v2TextSeen.get(key) ?? 0;
+          this.v2TextBuffers.set(key, fullText);
+          emit("message.part.updated", { part: { id: partID, sessionID, messageID, type: "text", text: fullText } });
+          if (fullText.length > prev) {
+            const delta = fullText.slice(prev);
+            this.v2TextSeen.set(key, fullText.length);
+            emit("message.part.delta", { sessionID, messageID, partID, field: "text", delta });
+          }
+        }
         break;
       }
       case "session.tool.called":
@@ -688,12 +693,18 @@ export class OpencodeClient {
 function normalizeV2Session(raw: Record<string, unknown>, fallbackDir: string): SessionInfo {
   const loc = (raw.location ?? {}) as Record<string, unknown>;
   const time = (raw.time ?? {}) as Record<string, unknown>;
+  const rawModel = (raw.model ?? {}) as { providerID?: unknown; modelID?: unknown; id?: unknown };
+  const model =
+    typeof rawModel.providerID === "string" && typeof (rawModel.modelID ?? rawModel.id) === "string"
+      ? { providerID: rawModel.providerID, modelID: String(rawModel.modelID ?? rawModel.id) }
+      : undefined;
   return {
     id: String(raw.id ?? raw.sessionID ?? ""),
     title: String(raw.title ?? ""),
     directory: String(loc.directory ?? raw.directory ?? fallbackDir ?? ""),
     parentID: typeof raw.parentID === "string" ? raw.parentID : undefined,
     agent: typeof raw.agent === "string" ? raw.agent : undefined,
+    model,
     version: String(raw.version ?? "2"),
     time: {
       created: typeof time.created === "number" ? time.created : Date.now(),
@@ -726,18 +737,27 @@ function normalizeV2Message(raw: Record<string, unknown>, sessionID: string): Wi
   const id = String(raw.id ?? "");
   const role: "user" | "assistant" = raw.type === "user" || raw.role === "user" ? "user" : "assistant";
   const time = (raw.time ?? {}) as Record<string, unknown>;
+  const rawModel = (raw.model ?? {}) as { providerID?: unknown; modelID?: unknown; id?: unknown };
+  const model =
+    typeof rawModel.providerID === "string" && typeof (rawModel.modelID ?? rawModel.id) === "string"
+      ? { providerID: rawModel.providerID, modelID: String(rawModel.modelID ?? rawModel.id) }
+      : undefined;
   const parts: Part[] = [];
   if (typeof raw.text === "string") {
-    parts.push({ id: `${id}:0`, sessionID, messageID: id, type: "text", text: raw.text });
+    parts.push({ id: `${id}:text`, sessionID, messageID: id, type: "text", text: raw.text });
   }
   if (Array.isArray(raw.content)) {
+    const textChunks: string[] = [];
     (raw.content as Array<Record<string, unknown>>).forEach((c, idx) => {
       if (c.type === "text" && typeof c.text === "string") {
-        parts.push({ id: `${id}:${idx}`, sessionID, messageID: id, type: "text", text: c.text });
+        textChunks.push(c.text);
       } else if (c.type === "tool") {
         parts.push(normalizeV2Tool(c, sessionID, id, idx));
       }
     });
+    if (textChunks.length > 0) {
+      parts.push({ id: `${id}:text`, sessionID, messageID: id, type: "text", text: textChunks.join("\n") });
+    }
   }
   return {
     info: {
@@ -745,6 +765,7 @@ function normalizeV2Message(raw: Record<string, unknown>, sessionID: string): Wi
       sessionID,
       role,
       agent: typeof raw.agent === "string" ? raw.agent : undefined,
+      model,
       time: {
         created: typeof time.created === "number" ? time.created : Date.now(),
         completed: typeof time.completed === "number" ? time.completed : undefined,

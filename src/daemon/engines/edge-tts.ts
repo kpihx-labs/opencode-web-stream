@@ -1,4 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { lookup } from "node:dns";
+import { Agent as HttpsAgent } from "node:https";
 import WebSocket from "ws";
 
 /**
@@ -87,6 +89,15 @@ export type EdgeTtsOutput = {
 };
 
 let clockSkewSec = 0;
+
+const edgeHttpsAgent = new HttpsAgent({
+  keepAlive: true,
+  maxSockets: 6,
+  keepAliveMsecs: 30_000,
+});
+
+// Pre-warm IPv4 DNS lookup once at daemon startup so first TTS avoids DNS stall.
+lookup("speech.platform.bing.com", { family: 4 }, () => undefined);
 
 function rotr(x: number, n: number): number {
   return ((x >>> n) | (x << (32 - n))) >>> 0;
@@ -319,7 +330,7 @@ export async function synthesizeEdgeTts(
 ): Promise<EdgeTtsOutput> {
   const voice = normalizeEdgeVoice(opts.voice, opts.lang);
   const rate = speedToRate(opts.speed ?? 1.0);
-  const timeoutMs = opts.timeoutMs ?? 12000;
+  const timeoutMs = opts.timeoutMs ?? 20000;
 
   try {
     return await runEdgeWs(text, voice, rate, timeoutMs, opts.signal);
@@ -353,6 +364,7 @@ function runEdgeWs(
       `&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}`;
 
     const ws = new WebSocket(url, {
+      agent: edgeHttpsAgent,
       family: 4,
       headers: {
         Pragma: "no-cache",

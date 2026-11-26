@@ -189,6 +189,7 @@ export class Hub implements Outbound {
           if (msg.directory) client.directory = msg.directory;
           client.visible = msg.visible;
           client.attachedAt = Date.now();
+          this.orchestrator.prewarm(msg.sessionID, client.directory);
           const snap = msg.sessionID ? this.orchestrator.snapshot(msg.sessionID) : undefined;
           if (snap) {
             this.send(client, { type: "state", sessionID: msg.sessionID, state: snap.state, blocked: snap.blocked });

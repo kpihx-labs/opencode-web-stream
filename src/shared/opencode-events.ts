@@ -50,6 +50,7 @@ export type MessageInfo = {
   sessionID: string;
   role: "user" | "assistant";
   agent?: string;
+  model?: ModelRef;
   time: { created: number; completed?: number };
   error?: { name?: string; data?: unknown };
   /** Assistant messages of a compaction turn carry this. */
@@ -62,6 +63,7 @@ export type SessionInfo = {
   directory: string;
   parentID?: string;
   agent?: string;
+  model?: ModelRef;
   version: string;
   time: { created: number; updated: number };
 };

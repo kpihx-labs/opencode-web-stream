@@ -26,6 +26,7 @@ type Job = {
 export type StreamerOptions = {
   agent: string;
   model: string;
+  mainModel?: ModelRef;
   summarizeEveryPrompts: number;
   titlePrefix?: string;
 };
@@ -34,7 +35,9 @@ export class StreamerSession {
   private queue: Job[] = [];
   private inflight?: { job: Job; controller: AbortController };
   private ensuring?: Promise<string>;
-  private readonly modelRef: ModelRef | undefined;
+  private readonly configuredModelRef: ModelRef | undefined;
+  private mainModelRef: ModelRef | undefined;
+  private appliedModelKey = "";
   private disposed = false;
 
   constructor(
@@ -47,11 +50,21 @@ export class StreamerSession {
     private readonly log: ScopedLogger,
     private readonly hooks: { onStreamerID: (id: string) => void },
   ) {
-    this.modelRef = parseModel(opts.model);
+    this.configuredModelRef = parseModel(opts.model);
+    this.mainModelRef = opts.mainModel;
+  }
+
+  private get effectiveModel(): ModelRef | undefined {
+    return this.configuredModelRef ?? this.mainModelRef;
   }
 
   setTitle(title: string) {
     this.mainTitle = title;
+  }
+
+  setMainModel(model: ModelRef | undefined) {
+    if (!model?.providerID || !model?.modelID) return;
+    this.mainModelRef = model;
   }
 
   get streamerID(): string | undefined {
@@ -68,6 +81,8 @@ export class StreamerSession {
   }
 
   private async doEnsure(): Promise<string> {
+    const model = this.effectiveModel;
+    const modelKey = model ? `${model.providerID}/${model.modelID}` : "";
     const existing = this.registry.binding(this.mainSessionID);
     if (existing) {
       try {
@@ -75,8 +90,9 @@ export class StreamerSession {
         if (info.agent !== this.opts.agent) {
           await this.client.setSessionAgent(existing.streamerID, existing.directory, this.opts.agent).catch(() => undefined);
         }
-        if (this.modelRef) {
-          await this.client.setSessionModel(existing.streamerID, existing.directory, this.modelRef).catch(() => undefined);
+        if (model && this.appliedModelKey !== modelKey) {
+          await this.client.setSessionModel(existing.streamerID, existing.directory, model).catch(() => undefined);
+          this.appliedModelKey = modelKey;
         }
         this.hooks.onStreamerID(existing.streamerID);
         return existing.streamerID;
@@ -90,8 +106,9 @@ export class StreamerSession {
     const created = await this.client.createSession(this.directory, {
       title,
       agent: this.opts.agent,
-      model: this.modelRef,
+      model,
     });
+    if (modelKey) this.appliedModelKey = modelKey;
     this.registry.bind(this.mainSessionID, {
       streamerID: created.id,
       directory: this.directory,
@@ -109,7 +126,7 @@ export class StreamerSession {
     const id = await this.ensure();
     await this.client.prompt(id, this.directory, {
       agent: this.opts.agent,
-      model: this.modelRef,
+      model: this.effectiveModel,
       noReply: true,
       parts: [{ type: "text", text }],
     });
@@ -161,7 +178,7 @@ export class StreamerSession {
         const res = await this.client.prompt(
           streamerID,
           this.directory,
-          { agent: this.opts.agent, model: this.modelRef, parts: [{ type: "text", text: job.prompt }] },
+          { agent: this.opts.agent, model: this.effectiveModel, parts: [{ type: "text", text: job.prompt }] },
           { signal: controller.signal, timeoutMs: job.timeoutMs + 2000 },
         );
         clearTimeout(timer);
@@ -194,9 +211,10 @@ export class StreamerSession {
   }
 
   private async compact(streamerID: string) {
-    if (!this.modelRef) return;
+    const model = this.effectiveModel;
+    if (!model) return;
     try {
-      await this.client.summarize(streamerID, this.directory, this.modelRef);
+      await this.client.summarize(streamerID, this.directory, model);
       this.log.info("streamer session summarized", { streamer: streamerID });
     } catch (e) {
       this.log.warn("streamer summarize failed", { error: e instanceof Error ? e.message : String(e) });

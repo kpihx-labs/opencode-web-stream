@@ -90,6 +90,8 @@ export type Session = {
   retryAnnounced: boolean;
   injectedTexts: string[];
   lastBeatAt: number;
+  recentFindings: string[];
+  recentSpoken: Array<{ text: string; at: number }>;
 };
 
 export class Orchestrator {
@@ -162,6 +164,8 @@ export class Orchestrator {
       retryAnnounced: false,
       injectedTexts: [],
       lastBeatAt: 0,
+      recentFindings: [],
+      recentSpoken: [],
     };
     this.sessions.set(id, s);
     return s;
@@ -180,7 +184,17 @@ export class Orchestrator {
   }
 
   private isStreamer(sessionID: string): boolean {
-    return this.streamerIDs.has(sessionID);
+    if (this.streamerIDs.has(sessionID)) return true;
+    const s = this.sessions.get(sessionID);
+    return Boolean(s && (s.agent === this.cfg.streamer.agent || s.title.startsWith("🎙 streamer")));
+  }
+
+  /** Pre-build lexicon and hydrate session metadata on cockpit attach for zero-delay startup. */
+  prewarm(sessionID: string, directory?: string) {
+    if (directory) void this.lexiconFor(directory);
+    if (!sessionID || this.isStreamer(sessionID)) return;
+    const s = this.sessions.get(sessionID) ?? (directory ? this.ensureSession(sessionID, directory) : undefined);
+    if (s && !s.title && !s.lastAnswer) void this.hydrate(s);
   }
 
   snapshot(sessionID: string): SessionSnapshot | undefined {
@@ -226,6 +240,7 @@ export class Orchestrator {
       }
       return { sessionID: "", title: "", directory: directoryHint, state: enabled ? "listening" : "idle", live: enabled, lang: this.cfg.speech.default };
     }
+    if (this.isStreamer(sessionID)) return undefined;
     let s = this.sessions.get(sessionID);
     if (!s) {
       const directory = directoryHint || (await this.resolveDirectory(sessionID));
@@ -239,7 +254,11 @@ export class Orchestrator {
     s.live = enabled;
     if (enabled) {
       this.log.info("live on", { sessionID, directory: s.directory });
-      await this.hydrate(s);
+      await Promise.all([this.hydrate(s), this.lexiconFor(s.directory)]);
+      if (this.isStreamer(sessionID)) {
+        s.live = false;
+        return undefined;
+      }
       this.setPhase(s, s.status === "busy" ? "thinking" : "listening");
       void this.startStreamer(s);
     } else {
@@ -291,10 +310,20 @@ export class Orchestrator {
             s.userPrompt = text;
             s.userPromptAt = m.info.time.created;
           }
-        } else if (text) {
-          s.lastAnswer = text;
+        } else {
+          if (m.info.agent) s.agent = m.info.agent;
+          if (m.info.model?.providerID) {
+            s.model = m.info.model;
+            s.streamer?.setMainModel(s.model);
+          }
+          if (text) s.lastAnswer = text;
         }
-        for (const p of m.parts) s.partTypes.set(p.id, p.type);
+        for (const p of m.parts) {
+          s.partTypes.set(p.id, p.type);
+          if (isToolPart(p) && p.state.status === "completed" && p.state.output) {
+            this.recordFinding(s, p.tool, p.state.output);
+          }
+        }
       }
     } catch (e) {
       this.log.warn("hydrate: messages lookup failed", { sessionID: s.id, error: e instanceof Error ? e.message : String(e) });
@@ -341,6 +370,7 @@ export class Orchestrator {
         {
           agent: this.cfg.streamer.agent,
           model: this.cfg.streamer.model,
+          mainModel: s.model,
           summarizeEveryPrompts: this.cfg.streamer.summarizeEveryPrompts,
         },
         this.log,
@@ -352,6 +382,8 @@ export class Orchestrator {
           },
         },
       );
+    } else {
+      s.streamer.setMainModel(s.model);
     }
     try {
       const lexicon = await this.lexiconFor(s.directory);
@@ -364,10 +396,11 @@ export class Orchestrator {
 
   private contextBlock(s: Session, lexicon: Lexicon | undefined): string {
     const lines = ["[CONTEXT]", `date: ${new Date().toISOString().slice(0, 16).replace("T", " ")}`, `session: ${s.title || s.id}`, `directory: ${s.directory}`];
-    if (s.agent) lines.push(`main agent: ${s.agent}`);
+    lines.push(`main agent you embody: ${s.agent || "Colab"}`);
     lines.push(`session is ${s.status}`);
     if (s.userPrompt) lines.push(`latest prompt from user: ${excerpt(s.userPrompt, 600)}`);
-    if (s.lastAnswer) lines.push(`latest answer (excerpt): ${excerpt(s.lastAnswer, 600)}`);
+    if (s.lastAnswer) lines.push(`latest answer on screen:\n${s.lastAnswer.slice(0, 4000)}`);
+    if (s.recentFindings.length) lines.push(`recent tool findings:\n${s.recentFindings.join("\n").slice(0, 2000)}`);
     lines.push(`answer reading mode: ${s.prefs.digest ? "digest" : "full"}`);
     lines.push(`languages: ${this.cfg.speech.languages.join(", ")} (default ${this.cfg.speech.default}); user last spoke ${s.lang}`);
     lines.push(renderLexiconContext(lexicon, this.registry.aliases(), this.cfg.lexicon.contextTerms));
@@ -487,8 +520,15 @@ export class Orchestrator {
           const s = this.ensureSession(info.sessionID, directory);
           if (info.role === "user") {
             s.userMessages.add(info.id);
-          } else if (info.time.completed && s.answer?.messageID === info.id) {
-            this.finishAnswer(s);
+          } else {
+            if (info.agent) s.agent = info.agent;
+            if (info.model?.providerID) {
+              s.model = info.model;
+              s.streamer?.setMainModel(s.model);
+            }
+            if (info.time.completed && s.answer?.messageID === info.id && s.status === "idle") {
+              this.finishAnswer(s);
+            }
           }
           return;
         }
@@ -572,9 +612,19 @@ export class Orchestrator {
     s.title = info.title || s.title;
     s.parentID = info.parentID;
     s.agent = info.agent ?? s.agent;
-    if (info.model?.providerID) s.model = { providerID: info.model.providerID, modelID: info.model.modelID ?? info.model.id ?? "" };
+    if (info.model?.providerID) {
+      s.model = { providerID: info.model.providerID, modelID: info.model.modelID ?? info.model.id ?? "" };
+      s.streamer?.setMainModel(s.model);
+    }
     if (!s.directory && info.directory) s.directory = info.directory;
     s.streamer?.setTitle(s.title);
+  }
+
+  private recordFinding(s: Session, tool: string, output: string) {
+    const clean = output.replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    s.recentFindings.push(`- ${tool}: ${excerpt(clean, 700)}`);
+    if (s.recentFindings.length > 4) s.recentFindings.shift();
   }
 
   private dropSession(id: string) {
@@ -647,6 +697,9 @@ export class Orchestrator {
     s.partTypes.set(part.id, part.type);
     if (isToolPart(part)) {
       const r = this.root(s);
+      if (part.state.status === "completed" && part.state.output) {
+        this.recordFinding(r, part.tool, part.state.output);
+      }
       if (!r.live) return;
       const via = s !== r ? s.agent ?? "sous-agent" : undefined;
       // A tool result arriving means the agent stopped talking for now.
@@ -687,7 +740,16 @@ export class Orchestrator {
 
   private answerFor(s: Session, messageID: string): AnswerStream {
     if (s.answer && s.answer.messageID === messageID) return s.answer;
-    if (s.answer) this.finishAnswer(s);
+    if (s.answer) {
+      if (s.status === "busy") {
+        // Same turn continuing after a tool call: replace pre-tool chatter with the new answer block.
+        if (s.answer.spokenSentences > 0) {
+          this.out.toSession(s.id, { type: "cancel", sessionID: s.id, streamId: s.answer.streamId });
+        }
+      } else {
+        this.finishAnswer(s);
+      }
+    }
     s.beats.flush("phase");
     s.answer = {
       messageID,
@@ -706,6 +768,17 @@ export class Orchestrator {
   private feedAnswer(s: Session, stream: AnswerStream, partID: string, delta: string) {
     stream.fed.set(partID, (stream.fed.get(partID) ?? 0) + delta.length);
     stream.fullText += delta;
+    const trimmed = stream.fullText.trim();
+    if (trimmed) s.lastAnswer = trimmed;
+    if (!stream.suppressed && isStructuredMarkdownReport(trimmed)) {
+      // Never read Markdown titles, tables or structured reports literally: let
+      // finishAnswer present the findings conversationally via askDigest.
+      stream.suppressed = true;
+      if (stream.spokenSentences > 0) {
+        this.out.toSession(s.id, { type: "cancel", sessionID: s.id, streamId: stream.streamId });
+      }
+      return;
+    }
     if (stream.suppressed) return;
     for (const sentence of stream.splitter.feed(delta)) this.emitAnswerSentence(s, stream, sentence, false);
   }
@@ -979,7 +1052,7 @@ export class Orchestrator {
   // ---- speech --------------------------------------------------------------
 
   private enqueueSpeech(s: Session, kind: SpeechKind, text: string, expiresAt: number, stream?: { streamId: string; streamSeq: number; streamEnd?: boolean }) {
-    const clean = text.replace(/\s+/g, " ").trim();
+    const clean = cleanSpokenText(text);
     if (!clean || !s.live) return;
     if (s.prefs.muted && kind !== "blocked") return;
     const utterance: Utterance = {
@@ -995,6 +1068,11 @@ export class Orchestrator {
     };
     if (kind !== "answer" || !stream || stream.streamSeq === 0) s.lastSpoken = clean;
     else s.lastSpoken = (s.lastSpoken ? s.lastSpoken + " " : "") + clean;
+    const now = Date.now();
+    s.recentSpoken.push({ text: clean, at: now });
+    while (s.recentSpoken.length > 12 || (s.recentSpoken.length > 0 && now - s.recentSpoken[0].at > 25000)) {
+      s.recentSpoken.shift();
+    }
     if (kind === "blocked" && s.status !== "idle" && s.phase !== "waiting_user") this.setPhase(s, "waiting_user");
     this.out.speak(utterance);
     this.log.debug("speak", { sessionID: s.id, kind, text: clean.slice(0, 120) });
@@ -1020,6 +1098,10 @@ export class Orchestrator {
     const s = this.sessions.get(sessionID);
     if (!s) return;
     s.streamer?.dropBeats();
+    if (s.answer) {
+      s.answer.suppressed = true;
+      this.out.toSession(s.id, { type: "cancel", sessionID: s.id, streamId: s.answer.streamId });
+    }
     this.setPhase(s, "interrupted");
   }
 
@@ -1040,6 +1122,14 @@ export class Orchestrator {
       sessionID = created;
     }
     const s = this.sessions.get(sessionID) ?? this.ensureSession(sessionID, opts.directory ?? "");
+    if (isEchoOfSpoken(raw, s.recentSpoken, s.lastSpoken)) {
+      this.log.debug("ignoring self-echo transcript", { sessionID: s.id, raw: raw.slice(0, 120) });
+      if (opts.bargeIn || s.phase === "interrupted") {
+        this.out.toSession(s.id, { type: "resume", sessionID: s.id });
+        this.setPhase(s, "speaking");
+      }
+      return "echo";
+    }
     if (!s.live) {
       await this.setLive(sessionID, true, opts.directory, opts.lang);
     }
@@ -1048,12 +1138,20 @@ export class Orchestrator {
       if (!s.streamer) return "no-streamer";
     }
     s.streamer.dropBeats();
+    if (s.answer) {
+      s.answer.suppressed = true;
+      this.out.toSession(s.id, { type: "cancel", sessionID: s.id, streamId: s.answer.streamId });
+    }
     this.setPhase(s, "thinking");
     this.setLanguage(s, opts.lang);
-    if (this.decision?.isReady && !s.pending && (opts.bargeIn || raw.length < 48)) {
-      const triage = await this.decision.triageVoice(raw, {
+    const screenAnswer = (s.answer?.fullText.trim() || s.lastAnswer).trim();
+    const hasScreenData = screenAnswer.length > 80 || s.recentFindings.length > 0;
+    let triage: "stop" | "noise" | "answer_from_context" | "pass" = "pass";
+    if (this.decision?.isReady && !s.pending) {
+      triage = await this.decision.triageVoice(raw, {
         speaking: s.phase === "speaking" || s.phase === "interrupted" || opts.bargeIn,
         busy: s.status === "busy",
+        hasScreenAnswer: hasScreenData,
       });
       if (triage === "noise" && raw.split(/\s+/).length <= 2) {
         s.lastHeard = { raw, corrected: raw };
@@ -1073,6 +1171,7 @@ export class Orchestrator {
     const lexicon = await this.lexiconFor(s.directory);
     const candidates = candidatesFor(raw, lexicon, this.registry.aliases(), { limit: this.cfg.lexicon.candidateTerms });
     const lines = ["[VOICE]", `transcript: ${raw}`];
+    lines.push(`main agent you embody: ${s.agent || "Colab"}`);
     lines.push(`language: ${s.lang}${opts.lang ? ` (recognizer said ${opts.lang})` : ""}`);
     lines.push(`session is ${s.status}${s.answer ? " and answering" : ""}`);
     if (opts.bargeIn) lines.push(`The user cut you off while you were saying: ${excerpt(opts.spokenOver ?? s.lastSpoken ?? "", 300)}`);
@@ -1084,8 +1183,14 @@ export class Orchestrator {
     }
     if (s.clarify) lines.push(`you asked for clarification: "${excerpt(s.clarify.question, 200)}" about: "${excerpt(s.clarify.transcript, 200)}"`);
     if (s.userPrompt) lines.push(`current task: ${excerpt(s.userPrompt, 300)}`);
-    if (s.lastAnswer) lines.push(`latest answer (excerpt): ${excerpt(s.lastAnswer, 500)}`);
+    if (screenAnswer) lines.push(`current answer on screen:\n${screenAnswer.slice(0, 6000)}`);
+    if (s.recentFindings.length) lines.push(`recent tool findings:\n${s.recentFindings.join("\n").slice(0, 2500)}`);
     if (s.todo) lines.push(`plan: ${excerpt(s.todo, 300)}`);
+    if (triage === "answer_from_context" && hasScreenData) {
+      lines.push(
+        "routing hint (local System-One): The user is asking to present, filter, or explain results ALREADY available in the current answer / tool findings above. Answer directly and conversationally with <reply>…</reply> using those findings. Do NOT emit <inject>.",
+      );
+    }
     if (candidates.length) {
       lines.push("project terms that sound like parts of the transcript (heard → term):");
       for (const c of candidates) lines.push(`- "${c.heard}" → ${c.term}`);
@@ -1331,4 +1436,57 @@ export class Orchestrator {
  */
 export function sessionUrl(directory: string, sessionID: string): string {
   return `/${Buffer.from(directory, "utf8").toString("base64")}/session/${encodeURIComponent(sessionID)}`;
+}
+
+/** True when a streamed answer is a structured Markdown report (headings, tables, code) that should be presented conversationally rather than read literally. */
+export function isStructuredMarkdownReport(text: string): boolean {
+  if (/^#{1,6}\s+\S/m.test(text)) return true;
+  if (/^\|.+\|\s*$/m.test(text)) return true;
+  if (/^```/m.test(text)) return true;
+  if ((text.match(/^[-*]\s+\S/gm)?.length ?? 0) >= 4) return true;
+  return false;
+}
+
+/**
+ * Detect when the browser's microphone recognizer transcribed the agent's own
+ * TTS voice bleeding from the speakers.
+ */
+export function isEchoOfSpoken(
+  transcript: string,
+  recentSpoken: Array<{ text: string; at: number }>,
+  lastSpoken?: string,
+  now = Date.now(),
+): boolean {
+  const words = tokenizeEchoWords(transcript);
+  if (words.length < 4) return false;
+  const recentTexts = recentSpoken.filter((r) => now - r.at <= 25000).map((r) => r.text);
+  if (lastSpoken) recentTexts.push(lastSpoken);
+  if (!recentTexts.length) return false;
+  const spokenPool = new Set(tokenizeEchoWords(recentTexts.join(" ")));
+  if (spokenPool.size < 4) return false;
+  let hits = 0;
+  for (const w of words) {
+    if (spokenPool.has(w)) hits += 1;
+  }
+  return hits / words.length >= 0.6;
+}
+
+/** Strip residual Markdown/formatting from spoken replies so TTS never reads asterisks or hashes aloud. */
+export function cleanSpokenText(text: string): string {
+  return text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[*_`~]/g, "")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\s*—\s*/g, ", ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeEchoWords(text: string): string[] {
+  return text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 3);
 }

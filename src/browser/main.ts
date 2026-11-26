@@ -56,6 +56,8 @@ class CockpitApp {
   private serverVoice = false;
   private unlocked = false;
   private speakingUtterance?: string;
+  private recentSpoken: Array<{ text: string; at: number }> = [];
+  private lastSpokeAt = 0;
   private interruptedAt = 0;
   private interruptedHeard = "";
   private falseBargeTimer?: number;
@@ -92,15 +94,20 @@ class CockpitApp {
       {
         onStart: (utterance) => {
           this.speakingUtterance = utterance.id;
+          this.lastSpokeAt = Date.now();
+          this.recentSpoken.push({ text: utterance.text, at: this.lastSpokeAt });
+          while (this.recentSpoken.length > 10) this.recentSpoken.shift();
           this.mic?.setDucked(true);
           this.ui.showSaying(utterance.text);
           this.ui.update({ state: "speaking" });
         },
         onEnd: (utterance, completed, heardText) => {
           this.speakingUtterance = undefined;
+          this.lastSpokeAt = Date.now();
           this.link.send({ type: "spoken", sessionID: this.sessionID, utteranceId: utterance.id, completed, heardText: completed ? undefined : heardText });
         },
         onIdle: () => {
+          this.lastSpokeAt = Date.now();
           this.mic?.setDucked(false);
           this.ui.showSaying(undefined);
         },
@@ -313,7 +320,7 @@ class CockpitApp {
   }
 
   private async startListening() {
-    await this.refreshStatus();
+    const statusPromise = this.refreshStatus();
     const reference = await this.player.unlock();
     this.mic = new Microphone(
       { referenceStream: reference },
@@ -329,14 +336,13 @@ class CockpitApp {
         },
         onLevel: (level) => this.ui.setLevel(level),
         onError: (err) => log.warn("microphone error", err),
+        onLoopback: (active) => this.player.setLoopbackActive(active),
       },
     );
-    try {
-      await this.mic.start();
-    } catch {
+    const micStart = this.mic.start().catch(() => {
       this.mic = undefined;
-    }
-    // The browser recognizer is the transcription path when the daemon has none.
+    });
+    // Start browser recognition immediately without blocking on status or model preloads.
     if (!this.serverEars && BrowserRecognizer.supported) {
       this.recognizer = new BrowserRecognizer({
         onFinal: (text) => void this.submitTranscript(text, this.consumeBargeIn()),
@@ -344,12 +350,12 @@ class CockpitApp {
         onError: (error) => log.debug("recognizer", error),
       });
       this.recognizer.setLang(this.recognizerLang());
-      await this.recognizer.prepareOnDevice();
       this.recognizer.start();
       log.info("using browser recognition", { lang: this.recognizerLang(), biasing: this.recognizer.supportsBiasing, onDevice: this.recognizer.supportsOnDevice });
     } else {
       log.info("using daemon transcription");
     }
+    await Promise.all([statusPromise, micStart]);
   }
 
   private async stopListening() {
@@ -436,13 +442,50 @@ class CockpitApp {
       onError: (error) => log.debug("recognizer", error),
     });
     this.recognizer.setLang(this.recognizerLang());
-    await this.recognizer.prepareOnDevice();
     this.recognizer.start();
     log.info("switched to browser recognition", { lang: this.recognizerLang() });
   }
 
+  private isSelfEcho(text: string): boolean {
+    const now = Date.now();
+    if (!this.player.isPlaying && now - this.lastSpokeAt > 12000) return false;
+    const words = text
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .split(/[^a-z0-9]+/)
+      .filter((w) => w.length >= 3);
+    if (words.length < 4) return false;
+    const pool = new Set(
+      this.recentSpoken
+        .filter((r) => now - r.at <= 25000)
+        .map((r) => r.text)
+        .join(" ")
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .split(/[^a-z0-9]+/)
+        .filter((w) => w.length >= 3),
+    );
+    if (pool.size < 4) return false;
+    let hits = 0;
+    for (const w of words) if (pool.has(w)) hits += 1;
+    return hits / words.length >= 0.6;
+  }
+
   private async submitTranscript(text: string, context: { bargeIn: boolean; spokenOver?: string }) {
     if (!text.trim() || !this.live) return;
+    if (this.isSelfEcho(text)) {
+      log.debug("dropped client self-echo", { text: text.slice(0, 80) });
+      if (context.bargeIn) {
+        this.link.send({ type: "barge_in_false", sessionID: this.sessionID });
+        this.player.resume();
+      }
+      return;
+    }
+    // User spoke a real follow-up: stop any remaining answer/beat chunks immediately.
+    this.player.cancel({ kind: "answer" });
+    this.player.cancel({ kind: "beat" });
     this.ui.update({ state: "thinking" });
     this.link.send({
       type: "transcript",

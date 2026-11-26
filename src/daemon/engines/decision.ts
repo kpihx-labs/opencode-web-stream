@@ -11,7 +11,7 @@ import type { ScopedLogger } from "../log.js";
  * handles everything without blocking.
  */
 
-export type VoiceTriage = "stop" | "noise" | "pass";
+export type VoiceTriage = "stop" | "noise" | "answer_from_context" | "pass";
 
 type ChoiceAnswer = {
   type: "choice";
@@ -105,9 +105,12 @@ export class DecisionEngine {
   }
 
   /** ~45 ms calibrated triage of a spoken utterance via Ollaya System One. */
-  async triageVoice(transcript: string, ctx: { speaking: boolean; busy: boolean }): Promise<VoiceTriage> {
+  async triageVoice(
+    transcript: string,
+    ctx: { speaking: boolean; busy: boolean; hasScreenAnswer?: boolean },
+  ): Promise<VoiceTriage> {
     if (!(await this.check())) return "pass";
-    const res = await this.askSystemOne(`speaking=${ctx.speaking} busy=${ctx.busy} text=${JSON.stringify(transcript)}`, {
+    const questions: Record<string, unknown> = {
       intent: {
         type: "choice",
         instructions: "Classify the user voice utterance while using a live coding assistant.",
@@ -117,12 +120,27 @@ export class DecisionEngine {
           pass: "A greeting, question, instruction, feedback, answer, or anything directed at the assistant (e.g. bonjour, ajoute un test, ok).",
         },
       },
-    });
+    };
+    if (ctx.hasScreenAnswer) {
+      questions.from_context = {
+        type: "noul",
+        instructions:
+          "Is the user asking to present, summarize, zoom in on, explain, or discuss results/topics that were already found or displayed on screen (e.g. 'present only the LLM part', 'what did you find about X', 'explain that'), rather than asking to write code or launch a brand new external search?",
+      };
+    }
+    const res = await this.askSystemOne(
+      `speaking=${ctx.speaking} busy=${ctx.busy} has_results_on_screen=${Boolean(ctx.hasScreenAnswer)} text=${JSON.stringify(transcript)}`,
+      questions,
+    );
     const ans = res?.answers?.intent as ChoiceAnswer | undefined;
     if (!ans || ans.type !== "choice") return "pass";
     const probs = ans.probabilities ?? {};
     if (ans.choice === "stop" && (probs.stop ?? 0) >= 0.4) return "stop";
     if (ans.choice === "noise" && (probs.noise ?? 0) >= 0.42) return "noise";
+    const fromCtx = res?.answers?.from_context as NoulAnswer | undefined;
+    if (ctx.hasScreenAnswer && fromCtx?.type === "noul" && typeof fromCtx.noul === "number" && fromCtx.noul >= 0.5) {
+      return "answer_from_context";
+    }
     return "pass";
   }
 

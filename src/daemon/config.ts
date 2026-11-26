@@ -124,7 +124,7 @@ export const DEFAULTS: Config = {
   },
   streamer: {
     agent: "streamer",
-    model: "opencode/deepseek-v4.1-flash-free",
+    model: "",
     beatTimeoutMs: 9000,
     voiceTimeoutMs: 20000,
     summarizeEveryPrompts: 80,
@@ -165,7 +165,7 @@ export const DEFAULTS: Config = {
     voices: { fr: "fr-FR-VivienneMultilingualNeural", en: "en-US-EmmaMultilingualNeural" },
     format: "mp3",
     speed: 1.05,
-    timeoutMs: 12000,
+    timeoutMs: 20000,
   },
   lexicon: {
     maxFiles: 6000,

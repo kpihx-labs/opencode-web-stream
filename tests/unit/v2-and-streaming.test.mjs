@@ -1,11 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DEFAULTS } from "../../dist/daemon/config.js";
 import { OpencodeClient } from "../../dist/daemon/opencode/client.js";
 import { DecisionEngine } from "../../dist/daemon/engines/decision.js";
 import { normalizeEdgeVoice, generateSecMsGecV2 } from "../../dist/daemon/engines/edge-tts.js";
+import { isStructuredMarkdownReport, isEchoOfSpoken } from "../../dist/daemon/core/orchestrator.js";
+import { Registry } from "../../dist/daemon/core/registry.js";
+import { StreamerSession } from "../../dist/daemon/core/streamer.js";
 import { Logger } from "../../dist/daemon/log.js";
 
 const log = new Logger({ level: "fatal" }).scope("test");
@@ -207,4 +212,91 @@ test("browser bundle resolves V2 tabs, WordBoundary heard text, and V2 composer 
   assert.match(bundle, /composer-actions/);
   assert.match(bundle, /AudioWorkletNode/);
   assert.match(bundle, /x-tts-boundaries/);
+  assert.match(bundle, /setLoopbackActive/);
+  assert.match(bundle, /phrases-not-supported/);
+});
+
+test("isStructuredMarkdownReport detects headings/tables and isEchoOfSpoken catches speaker bleed", () => {
+  assert.equal(isStructuredMarkdownReport("# Veille Technologique\n\nIntro"), true);
+  assert.equal(isStructuredMarkdownReport("| Col A | Col B |\n|---|---|\n| 1 | 2 |"), true);
+  assert.equal(isStructuredMarkdownReport("Bonjour, je regarde le démon maintenant."), false);
+
+  const recent = [{ text: "Je suis Colab, prêt à travailler avec toi sur ce projet.", at: Date.now() }];
+  assert.equal(isEchoOfSpoken("Je suis collab prêt à travailler avec toi", recent), true);
+  assert.equal(isEchoOfSpoken("Présente-moi uniquement la partie sur les LLM", recent), false);
+});
+
+test("Registry auto-loads Hex vocabulary terms and merges with learned aliases", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ows-hex-"));
+  try {
+    const hexPath = join(dir, "hex-settings.json");
+    writeFileSync(
+      hexPath,
+      JSON.stringify({
+        vocabulary: [
+          { term: "KpihX", sounds_like: ["kpi hx", "kapoi va"] },
+          { term: "Ollaya", sounds_like: ["oh la ya"] },
+        ],
+      }),
+    );
+    const reg = new Registry(dir, 50, hexPath);
+    reg.learn("l e m", "LLM", false);
+    const aliases = reg.aliases();
+    assert.ok(aliases.some((a) => a.heard === "kpi hx" && a.canonical === "KpihX"));
+    assert.ok(aliases.some((a) => a.heard === "oh la ya" && a.canonical === "Ollaya"));
+    assert.ok(aliases.some((a) => a.heard === "l e m" && a.canonical === "LLM"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("StreamerSession inherits main session model when streamer.model is empty", async () => {
+  const createdBodies = [];
+  const fakeClient = {
+    async createSession(_dir, body) {
+      createdBodies.push(body);
+      return { id: "ses_str", title: body.title, directory: "/repo", version: "2", time: { created: 1, updated: 1 } };
+    },
+    async getSession() {
+      return { id: "ses_str", title: "s", directory: "/repo", agent: "streamer", version: "2", time: { created: 1, updated: 1 } };
+    },
+  };
+  const dir = mkdtempSync(join(tmpdir(), "ows-str-"));
+  try {
+    const reg = new Registry(dir, 50, join(dir, "no-hex.json"));
+    const ss = new StreamerSession(
+      "ses_main",
+      "/repo",
+      "Main",
+      fakeClient,
+      reg,
+      { agent: "streamer", model: "", mainModel: { providerID: "custom", modelID: "fast-model" }, summarizeEveryPrompts: 80 },
+      log,
+      { onStreamerID() {} },
+    );
+    await ss.ensure();
+    assert.deepEqual(createdBodies[0].model, { providerID: "custom", modelID: "fast-model" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("DecisionEngine detects answer_from_context when results are already on screen", async () => {
+  const fakeFetch = async (url) => {
+    if (String(url).endsWith("/v1/models")) return new Response("{}", { status: 200 });
+    return new Response(
+      JSON.stringify({
+        answers: {
+          intent: { type: "choice", choice: "pass", probabilities: { stop: 0.05, noise: 0.05, pass: 0.9 } },
+          from_context: { type: "noul", noul: 0.84 },
+        },
+      }),
+      { status: 200 },
+    );
+  };
+  const engine = new DecisionEngine(DEFAULTS.decision, log, fakeFetch);
+  assert.equal(
+    await engine.triageVoice("Présente uniquement la partie LLM", { speaking: false, busy: false, hasScreenAnswer: true }),
+    "answer_from_context",
+  );
 });

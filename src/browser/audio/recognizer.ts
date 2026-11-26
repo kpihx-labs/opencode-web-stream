@@ -53,10 +53,13 @@ export class BrowserRecognizer {
   private recognition?: SpeechRecognitionLike;
   private wantRunning = false;
   private restartTimer?: number;
+  private watchdogTimer?: number;
   private consecutiveErrors = 0;
   private generation = 0;
   private lang = "fr-FR";
   private phrases: string[] = [];
+  private onDeviceReady = false;
+  private biasingAllowed = true;
   supportsBiasing = false;
   supportsOnDevice = false;
 
@@ -72,16 +75,19 @@ export class BrowserRecognizer {
 
   setLang(lang: string) {
     this.lang = lang;
+    this.onDeviceReady = false;
     if (this.recognition) this.recognition.lang = lang;
   }
 
   /** Cleanly restart recognition with a new language without racing Chromium's mic teardown. */
   restartWithLang(lang: string) {
     this.lang = lang;
+    this.onDeviceReady = false;
     const wasRunning = this.wantRunning;
     this.stop();
     if (!wasRunning) return;
     this.wantRunning = true;
+    this.startWatchdog();
     const seq = this.generation;
     this.restartTimer = window.setTimeout(() => {
       this.restartTimer = undefined;
@@ -90,27 +96,30 @@ export class BrowserRecognizer {
   }
 
   /**
-   * Install the project vocabulary. Biasing is applied where supported; the
-   * call is harmless where it is not.
+   * Install the project vocabulary. Biasing is applied only when supported
+   * by the current recognition mode so unsupported engines never stall.
    */
   setPhrases(phrases: string[]) {
     this.phrases = phrases;
-    if (this.recognition) this.applyPhrases(this.recognition);
+    if (this.recognition && this.onDeviceReady && this.biasingAllowed) {
+      this.applyPhrases(this.recognition);
+    }
   }
 
-  /** Ask the browser to fetch the on-device model, where that exists. */
+  /** Probe on-device model availability in the background (never blocks startup). */
   async prepareOnDevice(): Promise<boolean> {
     const Ctor = recognitionCtor();
     if (!Ctor?.available) return false;
     try {
       const state = await Ctor.available({ langs: [this.lang], processLocally: true });
-      if (state === "available") return true;
-      if (state === "downloadable" && Ctor.install) {
-        log.info("downloading on-device speech model", this.lang);
-        return await Ctor.install({ langs: [this.lang] });
+      if (state === "available") {
+        this.onDeviceReady = true;
+        return true;
       }
+      this.onDeviceReady = false;
       return false;
     } catch (err) {
+      this.onDeviceReady = false;
       log.debug("on-device probe failed", err);
       return false;
     }
@@ -118,7 +127,24 @@ export class BrowserRecognizer {
 
   start() {
     this.wantRunning = true;
+    this.startWatchdog();
     this.spawn();
+    void this.prepareOnDevice().then((ready) => {
+      if (ready && this.recognition && this.biasingAllowed) {
+        this.applyPhrases(this.recognition);
+      }
+    });
+  }
+
+  private startWatchdog() {
+    if (this.watchdogTimer) return;
+    this.watchdogTimer = window.setInterval(() => {
+      if (!this.wantRunning) return;
+      if (!this.recognition && !this.restartTimer) {
+        log.debug("recognizer watchdog reviving stopped engine");
+        this.spawn();
+      }
+    }, 2000);
   }
 
   private spawn() {
@@ -134,7 +160,9 @@ export class BrowserRecognizer {
     recognition.interimResults = true;
     recognition.lang = this.lang;
     recognition.maxAlternatives = 1;
-    this.applyPhrases(recognition);
+    if (this.onDeviceReady && this.biasingAllowed) {
+      this.applyPhrases(recognition);
+    }
     recognition.onresult = (event) => {
       if (seq !== this.generation) return;
       let interim = "";
@@ -156,6 +184,34 @@ export class BrowserRecognizer {
       const error = event.error || "unknown";
       // Silence and manual stops are normal operation, not failures.
       if (error === "no-speech" || error === "aborted") return;
+      // Edge on Linux advertises `phrases` / `available` on prototype, then throws
+      // `phrases-not-supported` / `language-not-supported` once set. Disable local
+      // biasing for the session and fall back to normal cloud recognition immediately.
+      if (error === "phrases-not-supported" || error === "language-not-supported") {
+        log.info("disabling local phrase biasing after engine rejection", { error, lang: this.lang });
+        this.biasingAllowed = false;
+        this.onDeviceReady = false;
+        this.consecutiveErrors = 0;
+        const stale = this.recognition;
+        this.recognition = undefined;
+        if (stale) {
+          stale.onresult = null;
+          stale.onend = null;
+          stale.onerror = null;
+          try {
+            stale.abort();
+          } catch {
+            // ignore
+          }
+        }
+        if (this.wantRunning && !this.restartTimer) {
+          this.restartTimer = window.setTimeout(() => {
+            this.restartTimer = undefined;
+            if (this.wantRunning && seq === this.generation) this.spawn();
+          }, 50);
+        }
+        return;
+      }
       this.consecutiveErrors += 1;
       log.warn("recognition error", error, event.message ?? "");
       this.events.onError(error);
@@ -165,8 +221,8 @@ export class BrowserRecognizer {
       if (seq !== this.generation) return;
       this.recognition = undefined;
       if (!this.wantRunning) return;
-      // Back off only after repeated failures; a clean end restarts at once.
-      const delay = this.consecutiveErrors > 1 ? Math.min(500 * 2 ** this.consecutiveErrors, 20000) : 150;
+      // Keep recovery snappy so mid-session resets never drop the user's next sentence.
+      const delay = this.consecutiveErrors > 2 ? Math.min(400 * 2 ** (this.consecutiveErrors - 2), 5000) : 80;
       this.restartTimer = window.setTimeout(() => {
         this.restartTimer = undefined;
         this.spawn();
@@ -186,7 +242,7 @@ export class BrowserRecognizer {
   }
 
   private applyPhrases(recognition: SpeechRecognitionLike) {
-    if (!this.supportsBiasing || !this.phrases.length) return;
+    if (!this.supportsBiasing || !this.biasingAllowed || !this.onDeviceReady || !this.phrases.length) return;
     const Phrase = (window as unknown as { SpeechRecognitionPhrase?: PhraseCtor }).SpeechRecognitionPhrase;
     if (!Phrase) return;
     try {
@@ -206,6 +262,8 @@ export class BrowserRecognizer {
   stop() {
     this.generation += 1;
     this.wantRunning = false;
+    if (this.watchdogTimer) window.clearInterval(this.watchdogTimer);
+    this.watchdogTimer = undefined;
     if (this.restartTimer) window.clearTimeout(this.restartTimer);
     this.restartTimer = undefined;
     const recognition = this.recognition;

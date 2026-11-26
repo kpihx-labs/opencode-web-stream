@@ -31,6 +31,7 @@ export type MicEvents = {
   onSilence: () => void;
   onLevel: (level: number) => void;
   onError: (error: unknown) => void;
+  onLoopback?: (active: boolean) => void;
 };
 
 export type MicOptions = {
@@ -93,7 +94,7 @@ export class Microphone {
   private worklet?: AudioWorkletNode;
   private workletUrl?: string;
   private source?: MediaStreamAudioSourceNode;
-  private loopback?: { local: RTCPeerConnection; remote: RTCPeerConnection };
+  private loopback?: { local: RTCPeerConnection; remote: RTCPeerConnection; audio?: HTMLAudioElement };
   private recorder?: MediaRecorder;
   private timer?: number;
   private buffer?: Float32Array<ArrayBuffer>;
@@ -146,7 +147,8 @@ export class Microphone {
     if (this.running) return;
     try {
       // The loopback must exist before capture so the canceller knows the reference.
-      await this.setupLoopback();
+      const loopbackOk = await this.setupLoopback();
+      this.events.onLoopback?.(loopbackOk);
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -183,18 +185,20 @@ export class Microphone {
    * A peer connection whose only job is to make the player's audio count as
    * remote, which is the condition for the browser's canceller to remove it.
    */
-  private async setupLoopback(): Promise<void> {
-    if (!this.referenceStream || this.loopback) return;
+  private async setupLoopback(): Promise<boolean> {
+    if (!this.referenceStream) return false;
+    if (this.loopback) return true;
     try {
       const local = new RTCPeerConnection();
       const remote = new RTCPeerConnection();
+      const audio = new Audio();
+      (audio as unknown as { playsInline?: boolean }).playsInline = true;
+      audio.autoplay = true;
       local.onicecandidate = (e) => e.candidate && remote.addIceCandidate(e.candidate).catch(() => undefined);
       remote.onicecandidate = (e) => e.candidate && local.addIceCandidate(e.candidate).catch(() => undefined);
       for (const track of this.referenceStream.getAudioTracks()) local.addTrack(track, this.referenceStream);
       remote.ontrack = (event) => {
-        const audio = new Audio();
         audio.srcObject = event.streams[0];
-        audio.autoplay = true;
         void audio.play().catch(() => undefined);
       };
       const offer = await local.createOffer();
@@ -203,11 +207,13 @@ export class Microphone {
       const answer = await remote.createAnswer();
       await remote.setLocalDescription(answer);
       await local.setRemoteDescription(answer);
-      this.loopback = { local, remote };
+      this.loopback = { local, remote, audio };
       log.debug("echo cancellation loopback established");
+      return true;
     } catch (err) {
       // Without the loopback, echo suppression falls back to ducking alone.
       log.warn("loopback setup failed, relying on ducking", err);
+      return false;
     }
   }
 
@@ -375,10 +381,19 @@ export class Microphone {
       this.context = undefined;
     }
     if (this.loopback) {
+      if (this.loopback.audio) {
+        try {
+          this.loopback.audio.pause();
+          this.loopback.audio.srcObject = null;
+        } catch {
+          // ignore
+        }
+      }
       this.loopback.local.close();
       this.loopback.remote.close();
       this.loopback = undefined;
     }
+    this.events.onLoopback?.(false);
   }
 }
 

@@ -1,4 +1,6 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 /**
@@ -31,10 +33,14 @@ const EMPTY: RegistryFile = { version: 1, streamers: {}, prefs: {}, aliases: [] 
 export class Registry {
   private data: RegistryFile;
   private saveTimer: NodeJS.Timeout | undefined;
+  private hexCache: { mtimeMs: number; aliases: Alias[] } = { mtimeMs: -1, aliases: [] };
   readonly path: string;
+  readonly hexSettingsPath: string;
 
-  constructor(dataDir: string, private readonly debounceMs = 250) {
+  constructor(dataDir: string, private readonly debounceMs = 250, hexSettingsPath?: string) {
     this.path = join(dataDir, "registry.json");
+    const isTempTest = !hexSettingsPath && dataDir.startsWith(tmpdir());
+    this.hexSettingsPath = hexSettingsPath ?? (isTempTest ? join(dataDir, "hex-settings.json") : join(homedir(), ".local", "share", "hex", "settings.json"));
     this.data = load(this.path);
   }
 
@@ -73,10 +79,43 @@ export class Registry {
   }
 
   aliases(): Alias[] {
-    return this.data.aliases.slice();
+    const hexAliases = this.loadHexAliases();
+    if (!hexAliases.length) return this.data.aliases.slice();
+    const byHeard = new Map<string, Alias>();
+    for (const a of hexAliases) byHeard.set(a.heard, a);
+    // Learned session aliases override or boost static Hex entries.
+    for (const a of this.data.aliases) byHeard.set(a.heard, a);
+    return [...byHeard.values()];
   }
 
-  learn(heard: string, canonical: string) {
+  private loadHexAliases(): Alias[] {
+    try {
+      if (!existsSync(this.hexSettingsPath)) return [];
+      const st = statSync(this.hexSettingsPath);
+      if (st.mtimeMs === this.hexCache.mtimeMs) return this.hexCache.aliases;
+      const raw = JSON.parse(readFileSync(this.hexSettingsPath, "utf8")) as {
+        vocabulary?: Array<{ term?: unknown; sounds_like?: unknown }>;
+      };
+      const out: Alias[] = [];
+      for (const entry of raw.vocabulary ?? []) {
+        const canonical = typeof entry?.term === "string" ? entry.term.trim() : "";
+        if (!canonical) continue;
+        const sounds = Array.isArray(entry.sounds_like) ? entry.sounds_like : [];
+        for (const s of sounds) {
+          const heard = typeof s === "string" ? s.trim().toLowerCase() : "";
+          if (heard && heard !== canonical.toLowerCase()) {
+            out.push({ heard, canonical, count: 3, updatedAt: 0 });
+          }
+        }
+      }
+      this.hexCache = { mtimeMs: st.mtimeMs, aliases: out };
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  learn(heard: string, canonical: string, syncHex = true) {
     const h = heard.trim().toLowerCase();
     const c = canonical.trim();
     if (!h || !c || h === c.toLowerCase()) return;
@@ -90,6 +129,9 @@ export class Registry {
       if (this.data.aliases.length > 2000) this.data.aliases.splice(0, this.data.aliases.length - 2000);
     }
     this.scheduleSave();
+    if (syncHex && existsSync(this.hexSettingsPath)) {
+      execFile("hex", ["vocabulary", "add", c, "--sounds-like", heard.trim()], { timeout: 3000 }, () => undefined);
+    }
   }
 
   private scheduleSave() {
