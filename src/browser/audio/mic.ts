@@ -137,8 +137,8 @@ export class Microphone {
       prerollMs: opts.prerollMs ?? 400,
       minUtteranceMs: opts.minUtteranceMs ?? 380,
       maxUtteranceMs: opts.maxUtteranceMs ?? 0,
-      marginDb: opts.marginDb ?? 9,
-      holdMarginDb: opts.holdMarginDb ?? 5,
+      marginDb: opts.marginDb ?? 13,
+      holdMarginDb: opts.holdMarginDb ?? 8,
       duckedMarginDb: opts.duckedMarginDb ?? 26,
       duckedHoldMarginDb: opts.duckedHoldMarginDb ?? 15,
     };

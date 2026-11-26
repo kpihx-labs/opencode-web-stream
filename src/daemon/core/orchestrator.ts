@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
   GlobalEnvelope,
   MessageInfo,
@@ -81,6 +84,7 @@ export type Session = {
   /** Two-letter code of the language the user last spoke in. */
   lang: string;
   userMessages: Set<string>;
+  finishedAnswers: Set<string>;
   partTypes: Map<string, string>;
   streamer?: StreamerSession;
   streamerID?: string;
@@ -159,6 +163,7 @@ export class Orchestrator {
       prefs: { digest: prefs.digest ?? this.cfg.answer.mode === "digest", muted: prefs.muted ?? false },
       lang: this.registry.prefs(id).lang ?? this.cfg.speech.default,
       userMessages: new Set(),
+      finishedAnswers: new Set(),
       partTypes: new Map(),
       retryAnnounced: false,
       injectedTexts: [],
@@ -386,6 +391,8 @@ export class Orchestrator {
     lines.push(`answer reading mode: ${s.prefs.digest ? "digest" : "full"}`);
     lines.push(`languages: ${this.cfg.speech.languages.join(", ")} (default ${this.cfg.speech.default}); user last spoke ${s.lang}`);
     lines.push(renderLexiconContext(lexicon, this.registry.aliases(), Math.min(80, this.cfg.lexicon.contextTerms)));
+    const contract = loadStreamerContract();
+    if (contract) lines.push(`[CONTRACT]\n${contract}`);
     return lines.join("\n");
   }
 
@@ -701,6 +708,7 @@ export class Orchestrator {
       if ((part as { synthetic?: boolean }).synthetic || (part as { ignored?: boolean }).ignored) return;
       const r = this.root(s);
       if (s !== r || !r.live) return;
+      if (r.finishedAnswers.has(part.messageID)) return;
       // Reconcile: feed whatever we have not fed yet (covers missed deltas).
       const stream = this.answerFor(r, part.messageID);
       const fed = stream.fed.get(part.id) ?? 0;
@@ -716,6 +724,7 @@ export class Orchestrator {
     if (type !== "text") return; // reasoning or unknown: never spoken
     const r = this.root(s);
     if (s !== r || !r.live) return;
+    if (r.finishedAnswers.has(messageID)) return;
     const stream = this.answerFor(r, messageID);
     this.feedAnswer(r, stream, partID, delta);
   }
@@ -765,6 +774,10 @@ export class Orchestrator {
     const stream = s.answer;
     if (!stream) return;
     s.answer = undefined;
+    s.finishedAnswers.add(stream.messageID);
+    if (s.finishedAnswers.size > 60) {
+      s.finishedAnswers.delete(s.finishedAnswers.values().next().value as string);
+    }
     const full = stream.fullText.trim();
     if (full) s.lastAnswer = full;
     if (!stream.suppressed) {
@@ -971,8 +984,9 @@ export class Orchestrator {
   }
 
   private emitInflight(s: Session, speech: NonNullable<Session["inflightSpeech"]>, sentence: string, expiresAt: number) {
-    speech.spoke = true;
-    this.enqueueSpeech(s, speech.kind, sentence, expiresAt, { streamId: speech.streamId, streamSeq: speech.seq++ });
+    if (this.enqueueSpeech(s, speech.kind, sentence, expiresAt, { streamId: speech.streamId, streamSeq: speech.seq++ })) {
+      speech.spoke = true;
+    }
   }
 
   private applyDecisions(s: Session, decisions: Decision[], ctx: { spoke: boolean; source: "beat" | "voice" | "blocked" | "digest"; expiresAt?: number; transcript?: string; bargeIn?: boolean }) {
@@ -1057,10 +1071,10 @@ export class Orchestrator {
 
   // ---- speech --------------------------------------------------------------
 
-  private enqueueSpeech(s: Session, kind: SpeechKind, text: string, expiresAt: number, stream?: { streamId: string; streamSeq: number; streamEnd?: boolean }) {
+  private enqueueSpeech(s: Session, kind: SpeechKind, text: string, expiresAt: number, stream?: { streamId: string; streamSeq: number; streamEnd?: boolean }): boolean {
     const clean = cleanSpokenText(text);
-    if (!clean || !s.live) return;
-    if (s.prefs.muted && kind !== "blocked") return;
+    if (!clean || !s.live) return false;
+    if (s.prefs.muted && kind !== "blocked") return false;
     const utterance: Utterance = {
       id: `utt_${randomUUID().slice(0, 10)}`,
       sessionID: s.id,
@@ -1082,6 +1096,7 @@ export class Orchestrator {
     if (kind === "blocked" && s.status !== "idle" && s.phase !== "waiting_user") this.setPhase(s, "waiting_user");
     this.out.speak(utterance);
     this.log.debug("speak", { sessionID: s.id, kind, text: clean.slice(0, 120) });
+    return true;
   }
 
   onSpoken(sessionID: string, utteranceId: string, completed: boolean, heardText?: string) {
@@ -1174,6 +1189,10 @@ export class Orchestrator {
     lines.push(`status: ${s.status}${s.answer ? " answering" : ""}`);
     if (opts.bargeIn) lines.push(`spoken_over: ${excerpt(opts.spokenOver ?? s.lastSpoken ?? "", 300)}`);
     else if (s.lastSpoken) lines.push(`last_spoken: ${excerpt(s.lastSpoken, 200)}`);
+    const recent = s.recentSpoken.slice(-4).map((r) => r.text);
+    if (recent.length) {
+      lines.push(`recent_spoken:\n${recent.map((t) => `- ${excerpt(t, 200)}`).join("\n")}`);
+    }
     if (s.pending?.kind === "permission") {
       lines.push(`pending_permission: ${s.pending.req.permission} (${s.pending.req.patterns.join(", ")}) [once|always|reject]`);
     } else if (s.pending?.kind === "question") {
@@ -1450,9 +1469,30 @@ export function sessionUrl(directory: string, sessionID: string): string {
 export function cleanSpokenText(text: string): string {
   return text
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\p{Extended_Pictographic}/gu, "")
     .replace(/[*_`~]/g, "")
     .replace(/^#{1,6}\s+/gm, "")
     .replace(/\s*—\s*/g, ", ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+let cachedContract: string | undefined;
+
+function loadStreamerContract(): string {
+  if (cachedContract !== undefined) return cachedContract;
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 6; i++) {
+    const candidate = join(dir, "agent", "streamer.md");
+    if (existsSync(candidate)) {
+      const raw = readFileSync(candidate, "utf8");
+      cachedContract = raw.replace(/^---[\s\S]*?---\s*/, "").trim();
+      return cachedContract;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  cachedContract = "";
+  return "";
 }

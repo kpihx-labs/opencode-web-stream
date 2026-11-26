@@ -118,3 +118,26 @@ test("fallback injection queues cleanly without hardcoded canned speech when str
   const injected = h.opencode.prompts.find((p) => p.sessionID === session.id && p.async);
   assert.equal(injected?.body.parts?.[0]?.text, "lance une analyse complète");
 });
+
+test("late message.part.updated after session.idle does not double-speak an already finished answer", async (t) => {
+  const h = await setup();
+  t.after(() => h.cleanup());
+  const session = h.opencode.addSession({ id: "ses_dup", directory: DIRECTORY });
+  h.send({ type: "attach", sessionID: session.id, directory: DIRECTORY, protocol: 5, visible: true });
+  h.send({ type: "live", sessionID: session.id, enabled: true, directory: DIRECTORY });
+  await until(() => h.opencode.prompts.some((p) => p.body.noReply), { label: "seeded" });
+
+  const msgId = "msg_dup_1";
+  const partId = `${msgId}:text`;
+  const text = "Voici une réponse unique qui ne doit jamais être relue deux fois.";
+  h.opencode.emit(DIRECTORY, "session.status", { sessionID: session.id, status: { type: "busy" } });
+  h.opencode.emit(DIRECTORY, "message.updated", { info: { id: msgId, sessionID: session.id, role: "assistant", time: { created: Date.now() } } });
+  h.opencode.emit(DIRECTORY, "message.part.updated", { part: { id: partId, sessionID: session.id, messageID: msgId, type: "text", text } });
+  h.opencode.emit(DIRECTORY, "session.status", { sessionID: session.id, status: { type: "idle" } });
+  await until(() => h.spoken().length === 1, { label: "spoken once" });
+
+  // Late V2 reconciliation event arrives after idle: must NOT re-speak.
+  h.opencode.emit(DIRECTORY, "message.part.updated", { part: { id: partId, sessionID: session.id, messageID: msgId, type: "text", text } });
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(h.spoken().length, 1);
+});

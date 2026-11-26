@@ -576,10 +576,12 @@ export class OpencodeClient {
         if (!delta) break;
         const partID = `${messageID}:text`;
         const key = `${sessionID}:${partID}`;
+        if (!this.v2TextBuffers.has(key)) {
+          emit("message.part.updated", { part: { id: partID, sessionID, messageID, type: "text", text: "" } });
+        }
         const next = (this.v2TextBuffers.get(key) ?? "") + delta;
         this.v2TextBuffers.set(key, next);
         this.v2TextSeen.set(key, next.length);
-        emit("message.part.updated", { part: { id: partID, sessionID, messageID, type: "text", text: next } });
         emit("message.part.delta", { sessionID, messageID, partID, field: "text", delta });
         break;
       }
@@ -589,9 +591,11 @@ export class OpencodeClient {
         const text = typeof data.text === "string" ? data.text : "";
         const partID = `${messageID}:text`;
         const key = `${sessionID}:${partID}`;
+        if (!this.v2TextBuffers.has(key)) {
+          emit("message.part.updated", { part: { id: partID, sessionID, messageID, type: "text", text: "" } });
+        }
         const prev = this.v2TextSeen.get(key) ?? 0;
         this.v2TextBuffers.set(key, text);
-        emit("message.part.updated", { part: { id: partID, sessionID, messageID, type: "text", text } });
         if (text.length > prev) {
           const delta = text.slice(prev);
           this.v2TextSeen.set(key, text.length);
@@ -615,9 +619,11 @@ export class OpencodeClient {
           const fullText = textChunks.join("\n");
           const partID = `${messageID}:text`;
           const key = `${sessionID}:${partID}`;
+          if (!this.v2TextBuffers.has(key)) {
+            emit("message.part.updated", { part: { id: partID, sessionID, messageID, type: "text", text: "" } });
+          }
           const prev = this.v2TextSeen.get(key) ?? 0;
           this.v2TextBuffers.set(key, fullText);
-          emit("message.part.updated", { part: { id: partID, sessionID, messageID, type: "text", text: fullText } });
           if (fullText.length > prev) {
             const delta = fullText.slice(prev);
             this.v2TextSeen.set(key, fullText.length);
