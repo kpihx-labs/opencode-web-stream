@@ -69,6 +69,8 @@ export type SessionSnapshot = {
   lastHeard?: { raw: string; corrected: string };
   /** Two-letter code of the language the user last spoke in. */
   lang: string;
+  /** Whether answers are reformulated via streamer digest rather than read raw. */
+  digest?: boolean;
 };
 
 export type DaemonStatus = {

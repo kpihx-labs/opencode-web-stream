@@ -260,7 +260,7 @@ Each of these is covered by a test; treat the list as a specification.
 | Streamer session grows | Summarized automatically past the prompt budget. |
 | Huge tool output | Truncated before it reaches the model. |
 | Forty reads in a row | Windowed; a stale beat is dropped rather than spoken late. |
-| Answer full of code | Prose spoken live via `SentenceSplitter`, digest requested past the code ratio without cutting an active stream mid-sentence. |
+| Answer delivery | Default `answer.mode = "digest"`: main-session written answers are never piped raw to TTS; `streamer` presents them conversationally via `[ANSWER]` in the user's active language. |
 | User speaks over the voice | Audio pauses immediately (`pausedItem` + `resumeOffsetSec`); false barge-in resumes from the exact millisecond. |
 | Microphone hears the voice | Single-path WebRTC loopback echo cancellation (`setLoopbackActive`), ducked threshold (+900 ms tail), and `streamer` sees `last_spoken` in `[VOICE]` to ignore echoes in any language. |
 | Hex `no-speech` on ambient sound | Treated cleanly as empty transcript (`{ text: "" }`), never disables Hex STT. |

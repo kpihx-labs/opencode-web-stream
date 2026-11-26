@@ -171,7 +171,7 @@ test("a quiet streamer produces silence, not an empty utterance", async (t) => {
 });
 
 test("the final answer is spoken as it streams, sentence by sentence", async (t) => {
-  const h = await harness();
+  const h = await harness({ answer: { mode: "full" } });
   t.after(() => h.cleanup());
   const session = h.opencode.addSession({ id: "ses_main", directory: DIRECTORY });
   await goLive(h, session);
@@ -205,7 +205,7 @@ test("the final answer is spoken as it streams, sentence by sentence", async (t)
 });
 
 test("reasoning deltas are never spoken", async (t) => {
-  const h = await harness();
+  const h = await harness({ answer: { mode: "full" } });
   t.after(() => h.cleanup());
   const session = h.opencode.addSession({ id: "ses_main", directory: DIRECTORY });
   await goLive(h, session);

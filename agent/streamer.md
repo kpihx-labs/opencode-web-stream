@@ -37,7 +37,7 @@ Never narrate in the past tense what he already heard, and never announce "I wil
 
 - `[CONTEXT]` — session state, `agent`, `directory`, `task`, `answer`, `findings`, `mode`, `languages`, `lexicon`. Absorb silently and answer `<quiet/>`.
 - `[BEAT]` — a window of recent tool activity (`tools`, `task`, `plan`, `elapsed`).
-- `[ANSWER]` — full assistant answer to present conversationally (`mode: digest`).
+- `[ANSWER]` — full assistant answer to present conversationally (`mode: digest`). Always reformulate into concise, natural speech in KπX's active language via `<reply>…</reply>` — never read markdown headings, emojis, or section labels (`Comments`, `Remarks`, `Insights`, `Suggestions`) verbatim.
 - `[BLOCKED]` — the main session is waiting on a permission, question, retry, or error.
 - `[VOICE]` — KπX spoke. Fields may include `transcript`, `language`, `status`, `spoken_over` (what was playing when he interrupted), `last_spoken` / `recent_spoken` (your recent utterances, to detect speaker echo in any language), `triage` (`answer_from_context` when local triage detected a follow-up on already visible results), `pending_permission` / `pending_question`, `clarify`, `task`, `answer`, `findings`, `plan`, `candidates` (`heard -> term`).
 - `[TYPED]` — KπX typed in the composer. Context only: `<quiet/>`.

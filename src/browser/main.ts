@@ -51,7 +51,7 @@ class CockpitApp {
   private directory = "";
   private live = false;
   private muted = readFlag(MUTE_KEY, false);
-  private digest = false;
+  private digest = true;
   private serverEars = false;
   private serverVoice = false;
   private sttEngine: "browser" | "server" | "hex" = "hex";
@@ -133,7 +133,7 @@ class CockpitApp {
     this.sessionID = sessionIdFromLocation();
     this.directory = resolveWorkspaceDirectory(this.sessionID);
     this.ui.mount();
-    this.ui.update({ muted: this.muted, state: "idle", lang: this.lang });
+    this.ui.update({ muted: this.muted, digest: this.digest, state: "idle", lang: this.lang });
     this.refreshDirState();
     this.link.open();
     void this.refreshStatus();

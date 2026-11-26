@@ -216,6 +216,7 @@ export class Orchestrator {
       lastSpoken: s.lastSpoken,
       lastHeard: s.lastHeard,
       lang: s.lang,
+      digest: s.prefs.digest,
     };
   }
 

@@ -28,6 +28,7 @@ async function setup(overrides = {}) {
     tts: { ...DEFAULTS.tts, mode: "off", url: "" },
     streamer: { ...DEFAULTS.streamer, injectDelayMs: 20, blockedRepeatMs: 0, ...overrides.streamer },
     beats: { ...DEFAULTS.beats, windowMs: 60, ttlMs: 8000, ...overrides.beats },
+    answer: { ...DEFAULTS.answer, ...overrides.answer },
     lexicon: { ...DEFAULTS.lexicon, maxFiles: 50, maxTerms: 100 },
   };
   const daemon = await startDaemon(cfg, { logger: new Logger({ level: "error" }) });
@@ -78,7 +79,7 @@ test("long untagged digest reply is split into multiple bounded sentences, never
 });
 
 test("already-speaking answer stream is NOT cancelled mid-way when a markdown list appears later", async (t) => {
-  const h = await setup();
+  const h = await setup({ answer: { mode: "full" } });
   t.after(() => h.cleanup());
   const session = h.opencode.addSession({ id: "ses_md", directory: DIRECTORY });
   h.send({ type: "attach", sessionID: session.id, directory: DIRECTORY, protocol: 5, visible: true });
@@ -120,7 +121,7 @@ test("fallback injection queues cleanly without hardcoded canned speech when str
 });
 
 test("late message.part.updated after session.idle does not double-speak an already finished answer", async (t) => {
-  const h = await setup();
+  const h = await setup({ answer: { mode: "full" } });
   t.after(() => h.cleanup());
   const session = h.opencode.addSession({ id: "ses_dup", directory: DIRECTORY });
   h.send({ type: "attach", sessionID: session.id, directory: DIRECTORY, protocol: 5, visible: true });
@@ -143,7 +144,7 @@ test("late message.part.updated after session.idle does not double-speak an alre
 });
 
 test("preliminary heard arrives before reply speech and activeAnswerStreamId is cancelled after idle", async (t) => {
-  const h = await setup();
+  const h = await setup({ answer: { mode: "full" } });
   t.after(() => h.cleanup());
   const session = h.opencode.addSession({ id: "ses_chrono", directory: DIRECTORY });
   h.send({ type: "attach", sessionID: session.id, directory: DIRECTORY, protocol: 5, visible: true });
@@ -169,4 +170,33 @@ test("preliminary heard arrives before reply speech and activeAnswerStreamId is 
   const speakIdx = slice.findIndex((m) => m.type === "speak");
   assert.ok(prelimIdx >= 0 && speakIdx > prelimIdx, "heard must appear chronologically before reply speech");
   assert.ok(slice.some((m) => m.type === "cancel" && String(m.streamId || "").startsWith(`ans_${msgId}`)), "finished answer streamId must be cancelled on follow-up reply");
+});
+
+test("default digest mode never sends raw main-agent text to TTS and presents cleanly via streamer", async (t) => {
+  const h = await setup();
+  t.after(() => h.cleanup());
+  const session = h.opencode.addSession({ id: "ses_digest_def", directory: DIRECTORY });
+  h.send({ type: "attach", sessionID: session.id, directory: DIRECTORY, protocol: 5, visible: true });
+  h.send({ type: "live", sessionID: session.id, enabled: true, directory: DIRECTORY });
+  await until(() => h.opencode.prompts.some((p) => p.body.noReply), { label: "seeded" });
+
+  h.opencode.replyWith("<reply>Tu as 35 projets actifs dans ton contexte.</reply>");
+  h.opencode.emit(DIRECTORY, "session.status", { sessionID: session.id, status: { type: "busy" } });
+  h.opencode.emit(DIRECTORY, "message.updated", { info: { id: "msg_raw", sessionID: session.id, role: "assistant", time: { created: Date.now() } } });
+  h.opencode.emit(DIRECTORY, "message.part.updated", {
+    part: {
+      id: "msg_raw:text",
+      sessionID: session.id,
+      messageID: "msg_raw",
+      type: "text",
+      text: "💬 **Comments** — The k-context skill is massively detailed (244 lines) and serves as the canonical HOT context.",
+    },
+  });
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(h.spoken().length, 0, "raw main-agent prose must NEVER go directly to TTS while streaming");
+
+  h.opencode.emit(DIRECTORY, "session.status", { sessionID: session.id, status: { type: "idle" } });
+  await until(() => h.spoken().length === 1, { label: "streamer digest spoken" });
+  assert.equal(h.spoken()[0].text, "Tu as 35 projets actifs dans ton contexte.");
+  assert.equal(h.spoken()[0].kind, "reply");
 });

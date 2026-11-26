@@ -147,7 +147,7 @@ export const DEFAULTS: Config = {
     outputChars: 320,
   },
   answer: {
-    mode: "full",
+    mode: "digest",
     codeRatioForDigest: 0.5,
     codeNotice: "",
     tableNotice: "",
