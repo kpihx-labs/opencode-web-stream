@@ -65,8 +65,9 @@ browser (Lens plugin)          daemon (this repo)              opencode serve
             /v1/systemone          (or browser/URL)    (no deflate + warm WS)
 ```
 
-- **`src/daemon`** — the brain. Subscribes to the OpenCode event bus, keeps one
-  state machine per live session, routes triage via Ollaya `largha` and
+- **`src/daemon`** — the brain. Subscribes to the OpenCode event bus, keeps a real-time
+  `ExecutionLedger` per root session (running tools, active subagents, recent finished tools,
+  intermediate chat notes, and screen text), routes triage via Ollaya `largha` and
   judgement via `streamer`, acts on the session through the REST API, serves the cockpit.
 - **`src/browser`** — the cockpit. Audio in (16 kHz WAV + live Web Speech interim preview),
   audio out (`AudioBuffer` with exact-offset pause/resume + WebRTC loopback AEC),

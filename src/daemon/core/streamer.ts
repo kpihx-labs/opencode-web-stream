@@ -17,7 +17,7 @@ export type AskResult = { text: string; aborted: boolean; superseded?: boolean; 
 
 type Job = {
   kind: AskKind;
-  prompt: string;
+  prompt: string | (() => string);
   timeoutMs: number;
   resolve: (r: AskResult | undefined) => void;
   onStart?: () => void;
@@ -147,7 +147,7 @@ export class StreamerSession {
    * Ask the streamer. Resolves with its text, or undefined when the request
    * was superseded, aborted, or timed out.
    */
-  ask(kind: AskKind, prompt: string, timeoutMs: number, onStart?: () => void): Promise<AskResult | undefined> {
+  ask(kind: AskKind, prompt: string | (() => string), timeoutMs: number, onStart?: () => void): Promise<AskResult | undefined> {
     if (this.disposed) return Promise.resolve(undefined);
     return new Promise((resolve) => {
       const job: Job = { kind, prompt, timeoutMs, resolve, onStart };
@@ -216,10 +216,11 @@ export class StreamerSession {
               attempt: i + 1,
               total: candidates.length,
             });
+            const promptText = typeof job.prompt === "function" ? job.prompt() : job.prompt;
             const attemptRes = await this.client.prompt(
               streamerID,
               this.directory,
-              { agent: this.opts.agent, model, parts: [{ type: "text", text: job.prompt }] },
+              { agent: this.opts.agent, model, parts: [{ type: "text", text: promptText }] },
               { signal: controller.signal, timeoutMs: job.timeoutMs > 0 ? job.timeoutMs + 2000 : 0 },
             );
             const attemptText = textOf(attemptRes?.parts);

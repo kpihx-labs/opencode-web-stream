@@ -10,6 +10,7 @@ import { DecisionEngine } from "../../dist/daemon/engines/decision.js";
 import { SttEngine } from "../../dist/daemon/engines/stt.js";
 import { normalizeEdgeVoice, generateSecMsGecV2 } from "../../dist/daemon/engines/edge-tts.js";
 import { Registry } from "../../dist/daemon/core/registry.js";
+import { ExecutionLedger } from "../../dist/daemon/core/ledger.js";
 import { StreamerSession } from "../../dist/daemon/core/streamer.js";
 import { Logger } from "../../dist/daemon/log.js";
 
@@ -418,4 +419,87 @@ process.exit(1);
   } finally {
     rm(dir, { recursive: true, force: true });
   }
+});
+
+test("V2 client classifies synthetic/idle messages as non-assistant and rejects aborted prompt without scanning synthetic messages", async (t) => {
+  const server = createServer((req, res) => {
+    if (req.url === "/api/info") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ version: "2.4.2" }));
+      return;
+    }
+    if (req.url?.startsWith("/api/session/ses_s/message")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          data: [
+            { id: "msg_syn", type: "synthetic", time: { created: 1000 }, text: "[HEARD]\nheard: leak" },
+            { id: "msg_idle", type: "idle", time: { created: 1001 } },
+            { id: "msg_a", type: "assistant", time: { created: 1002, completed: 1003 }, content: [{ type: "text", text: "<reply>OK</reply>" }] },
+          ],
+        }),
+      );
+      return;
+    }
+    if (req.url === "/api/session/ses_s/prompt") {
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: { time: { created: 1000 } } }));
+      }, 20);
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => new Promise((r) => server.close(r)));
+  const client = new OpencodeClient({ baseUrl: `http://127.0.0.1:${server.address().port}`, log });
+
+  const msgs = await client.messages("ses_s", "/repo");
+  const syn = msgs.find((m) => m.info.id === "msg_syn");
+  const idle = msgs.find((m) => m.info.id === "msg_idle");
+  const asst = msgs.find((m) => m.info.id === "msg_a");
+  assert.notEqual(syn?.info.role, "assistant");
+  assert.equal(Boolean(syn?.parts[0]?.synthetic), true);
+  assert.notEqual(idle?.info.role, "assistant");
+  assert.equal(asst?.info.role, "assistant");
+
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(new Error("superseded")), 10);
+  await assert.rejects(
+    client.prompt("ses_s", "/repo", { parts: [{ type: "text", text: "test" }] }, { signal: ac.signal, timeoutMs: 2000 }),
+    /superseded|aborted/,
+  );
+});
+
+test("ExecutionLedger tracks running tools, subagents, recent completed tools, and chat notes live", () => {
+  const ledger = new ExecutionLedger();
+  const t0 = 100_000;
+  ledger.setTask("Cherche les dossiers 4A", t0);
+  ledger.onStatus("ses_main", true, { type: "busy" }, t0);
+  ledger.onSubagentInfo("ses_sub1", { agent: "explore", title: "Scan Gdrive_X", status: "busy" }, t0 + 500);
+  ledger.onSubagentText("ses_sub1", "Checking Docs/Academic/X/4A", t0 + 900);
+  ledger.onTool(
+    { id: "p1", sessionID: "ses_main", messageID: "m1", type: "tool", tool: "execute", callID: "c1", state: { status: "completed", input: { command: "plocate 4A" }, output: "[]" } },
+    "ses_main",
+    undefined,
+    t0 + 1000,
+  );
+  ledger.onTool(
+    { id: "p2", sessionID: "ses_sub1", messageID: "m2", type: "tool", tool: "shell", callID: "c2", state: { status: "running", input: { command: "find ~/Gdrive_X/Docs/Academic/X/4A" } } },
+    "ses_sub1",
+    "explore",
+    t0 + 1500,
+  );
+  ledger.onChatNote("J'ai trouvé le dossier Admission dans Gdrive_X.", t0 + 2000);
+
+  const rendered = ledger.renderLiveState({ screenText: "Listing ENSTA et Telecom...", now: t0 + 4000 });
+  assert.match(rendered, /session_status: busy/);
+  assert.match(rendered, /running_tools_now \(1\):/);
+  assert.match(rendered, /shell via explore.*find ~\/Gdrive_X\/Docs\/Academic\/X\/4A/);
+  assert.match(rendered, /active_subagents \(1\):/);
+  assert.match(rendered, /explore "Scan Gdrive_X"/);
+  assert.match(rendered, /recent_completed_tools \(1\):/);
+  assert.match(rendered, /recent_chat_notes \(1\):/);
+  assert.match(rendered, /latest_screen_text:\nListing ENSTA et Telecom\.\.\./);
 });

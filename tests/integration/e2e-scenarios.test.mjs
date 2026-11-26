@@ -226,3 +226,61 @@ test("newer voice turn supersedes stalled voice turn without fallback-injecting 
   assert.equal(h.msgs.some((m) => m.type === "inject_done"), false, "superseded voice turn must NEVER trigger fallback injection");
   assert.equal(h.spoken().some((s) => s.text.includes("obsolète")), false, "superseded voice turn must not speak");
 });
+
+test("beat and voice prompts carry live running tools and subagents so streamer never claims failure mid-work", async (t) => {
+  const h = await setup({ beats: { windowMs: 40, progressIntervalMs: 0 } });
+  t.after(() => h.cleanup());
+  const session = h.opencode.addSession({ id: "ses_sync", directory: DIRECTORY });
+  const child = h.opencode.addSession({ id: "ses_sync_sub", parentID: session.id, agent: "explore", title: "Scan 4A", directory: DIRECTORY });
+  h.send({ type: "attach", sessionID: session.id, directory: DIRECTORY, protocol: 5, visible: true });
+  h.send({ type: "live", sessionID: session.id, enabled: true, directory: DIRECTORY });
+  await until(() => h.opencode.prompts.some((p) => p.body.noReply), { label: "seeded" });
+
+  h.opencode.emit(DIRECTORY, "session.status", { sessionID: session.id, status: { type: "busy" } });
+  h.opencode.emit(DIRECTORY, "session.created", { info: child });
+  h.opencode.emit(DIRECTORY, "session.status", { sessionID: child.id, status: { type: "busy" } });
+  // Tool 1 finishes empty, while Tool 2 is ALREADY running via subagent.
+  h.opencode.emit(DIRECTORY, "message.part.updated", {
+    part: { id: "p_done", sessionID: session.id, messageID: "m1", type: "tool", tool: "bash", callID: "c1", state: { status: "completed", input: { command: "plocate 4A" }, output: "" } },
+  });
+  h.opencode.emit(DIRECTORY, "message.part.updated", {
+    part: { id: "p_run", sessionID: child.id, messageID: "m2", type: "tool", tool: "bash", callID: "c2", state: { status: "running", input: { command: "find ~/Gdrive_X/Docs/Academic/X/4A" } } },
+  });
+
+  // Wait for beat prompt; also verify non-voice <inject> from a beat is strictly ignored!
+  h.opencode.replyWith('<inject mode="queue">DO NOT INJECT FROM BEAT</inject><say>Je poursuis la recherche dans Admission.</say>');
+  await until(() => h.opencode.prompts.some((p) => p.body.parts?.[0]?.text?.startsWith("[BEAT]")), { label: "beat with live state" });
+  const beatPrompt = h.opencode.prompts.find((p) => p.body.parts?.[0]?.text?.startsWith("[BEAT]"))?.body.parts[0].text ?? "";
+  assert.match(beatPrompt, /\[LIVE STATE\]/);
+  assert.match(beatPrompt, /session_status: busy/);
+  assert.match(beatPrompt, /running_tools_now \(1\):/);
+  assert.match(beatPrompt, /active_subagents \(1\):/);
+  assert.equal(h.msgs.some((m) => m.type === "inject_done"), false, "non-voice beats must NEVER execute <inject>");
+
+  // Voice status query sees the exact live running command and subagent.
+  h.opencode.replyWith("<reply>Je suis en train de scanner le dossier 4A via le sous-agent explore.</reply>");
+  h.send({ type: "transcript", sessionID: session.id, text: "Qu'est-ce que tu es en train de faire ?", bargeIn: false, directory: DIRECTORY });
+  await until(() => h.opencode.prompts.some((p) => p.body.parts?.[0]?.text?.startsWith("[VOICE]")), { label: "voice prompt" });
+  const voicePrompt = h.opencode.prompts.find((p) => p.body.parts?.[0]?.text?.startsWith("[VOICE]"))?.body.parts[0].text ?? "";
+  assert.match(voicePrompt, /running_tools_now \(1\):/);
+  assert.match(voicePrompt, /active_subagents \(1\):/);
+});
+
+test("long busy turn triggers periodic [PROGRESS] check-in with live state", async (t) => {
+  const h = await setup({ beats: { windowMs: 5000, progressIntervalMs: 120 } });
+  t.after(() => h.cleanup());
+  const session = h.opencode.addSession({ id: "ses_prog", directory: DIRECTORY });
+  h.send({ type: "attach", sessionID: session.id, directory: DIRECTORY, protocol: 5, visible: true });
+  h.send({ type: "live", sessionID: session.id, enabled: true, directory: DIRECTORY });
+  await until(() => h.opencode.prompts.some((p) => p.body.noReply), { label: "seeded" });
+
+  h.opencode.replyWith("<say>Je parcours encore le dossier Admission.</say>");
+  h.opencode.emit(DIRECTORY, "session.status", { sessionID: session.id, status: { type: "busy" } });
+  h.opencode.emit(DIRECTORY, "message.part.updated", {
+    part: { id: "pr1", sessionID: session.id, messageID: "m1", type: "tool", tool: "bash", callID: "cr1", state: { status: "running", input: { command: "find ~/Gdrive_X" } } },
+  });
+
+  await until(() => h.opencode.prompts.some((p) => p.body.parts?.[0]?.text?.startsWith("[PROGRESS]")), { label: "periodic progress" });
+  await until(() => h.spoken().some((s) => s.text.includes("Admission")), { label: "progress spoken" });
+  h.opencode.emit(DIRECTORY, "session.status", { sessionID: session.id, status: { type: "idle" } });
+});

@@ -51,6 +51,8 @@ export type Config = {
     ttlMs: number;
     inputChars: number;
     outputChars: number;
+    /** Interval while main session is busy to send a live progress check-in (0 disables). */
+    progressIntervalMs: number;
   };
   answer: {
     /** full = read the answer as it streams; digest = let the streamer summarize. */
@@ -145,6 +147,7 @@ export const DEFAULTS: Config = {
     ttlMs: 9000,
     inputChars: 220,
     outputChars: 320,
+    progressIntervalMs: 12000,
   },
   answer: {
     mode: "digest",

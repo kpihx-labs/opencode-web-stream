@@ -21,6 +21,7 @@ import { candidatesFor, renderLexiconContext, topPhrases } from "../lexicon/matc
 import { OpencodeClient } from "../opencode/client.js";
 import type { DecisionEngine } from "../engines/decision.js";
 import { BeatWindow, excerpt, renderBeat, type Beat } from "./beats.js";
+import { ExecutionLedger } from "./ledger.js";
 import type { Registry } from "./registry.js";
 import { codeRatio, SentenceSplitter } from "./sentences.js";
 import { StreamerSession } from "./streamer.js";
@@ -97,6 +98,11 @@ export type Session = {
   recentSpoken: Array<{ text: string; at: number }>;
   activeAnswerStreamId?: string;
   activeReplyStreamId?: string;
+  ledger: ExecutionLedger;
+  answerFinishTimer?: NodeJS.Timeout;
+  progressTimer?: NodeJS.Timeout;
+  lastPermissionRepliedAt?: number;
+  lastQuestionRepliedAt?: number;
 };
 
 export class Orchestrator {
@@ -172,6 +178,7 @@ export class Orchestrator {
       lastBeatAt: 0,
       recentFindings: [],
       recentSpoken: [],
+      ledger: new ExecutionLedger(),
     };
     this.sessions.set(id, s);
     return s;
@@ -266,9 +273,11 @@ export class Orchestrator {
         return undefined;
       }
       this.setPhase(s, s.status === "busy" ? "thinking" : "listening");
+      if (s.status === "busy") this.syncProgressTimer(s);
       void this.startStreamer(s);
     } else {
       this.log.info("live off", { sessionID });
+      this.stopProgressTimer(s);
       s.beats.flush("phase");
       this.clearInject(s);
       s.streamer?.dropBeats();
@@ -298,6 +307,7 @@ export class Orchestrator {
           if (text) {
             s.userPrompt = text;
             s.userPromptAt = m.info.time.created;
+            s.ledger.setTask(text, m.info.time.created);
           }
         } else {
           if (m.info.agent) s.agent = m.info.agent;
@@ -309,8 +319,11 @@ export class Orchestrator {
         }
         for (const p of m.parts) {
           s.partTypes.set(p.id, p.type);
-          if (isToolPart(p) && p.state.status === "completed" && p.state.output) {
-            this.recordFinding(s, p.tool, p.state.output);
+          if (isToolPart(p)) {
+            s.ledger.onTool(p, s.id, undefined);
+            if (p.state.status === "completed" && p.state.output) {
+              this.recordFinding(s, p.tool, p.state.output);
+            }
           }
         }
       }
@@ -320,7 +333,10 @@ export class Orchestrator {
     try {
       const status = await this.client.sessionStatus(s.directory);
       const st = status[s.id];
-      if (st) s.status = st.type;
+      if (st) {
+        s.status = st.type;
+        s.ledger.onStatus(s.id, true, st);
+      }
     } catch {
       // status is optional
     }
@@ -518,8 +534,18 @@ export class Orchestrator {
               s.model = info.model;
               s.streamer?.setMainModel(s.model);
             }
-            if (info.time.completed && s.answer?.messageID === info.id && s.status === "idle") {
-              this.finishAnswer(s);
+            const r = this.root(s);
+            if (s === r && info.time.completed && r.answer?.messageID === info.id) {
+              const full = r.answer.fullText.trim();
+              if (full) {
+                r.lastAnswer = full;
+                r.ledger.onChatNote(full);
+              }
+              if (r.status === "idle") {
+                this.finishAnswer(r);
+              } else {
+                this.scheduleBoundaryAnswerFinish(r, info.id);
+              }
             }
           }
           return;
@@ -561,7 +587,10 @@ export class Orchestrator {
         case "permission.replied": {
           const sessionID = props.sessionID as string;
           const s = this.sessions.get(sessionID);
-          if (s?.pending?.kind === "permission" && s.pending.req.id === props.requestID) this.clearPending(s);
+          if (s) {
+            s.lastPermissionRepliedAt = Date.now();
+            if (s.pending?.kind === "permission" && s.pending.req.id === props.requestID) this.clearPending(s);
+          }
           return;
         }
         case "question.asked": {
@@ -575,7 +604,10 @@ export class Orchestrator {
         case "question.rejected": {
           const sessionID = props.sessionID as string;
           const s = this.sessions.get(sessionID);
-          if (s?.pending?.kind === "question" && s.pending.req.id === props.requestID) this.clearPending(s);
+          if (s) {
+            s.lastQuestionRepliedAt = Date.now();
+            if (s.pending?.kind === "question" && s.pending.req.id === props.requestID) this.clearPending(s);
+          }
           return;
         }
         case "todo.updated": {
@@ -602,13 +634,17 @@ export class Orchestrator {
 
   private applySessionInfo(s: Session, info: SessionInfo & { model?: { providerID: string; id?: string; modelID?: string } }) {
     s.title = info.title || s.title;
-    s.parentID = info.parentID;
+    s.parentID = info.parentID ?? s.parentID;
     s.agent = info.agent ?? s.agent;
     if (info.model?.providerID) {
       s.model = { providerID: info.model.providerID, modelID: info.model.modelID ?? info.model.id ?? "" };
       s.streamer?.setMainModel(s.model);
     }
     if (!s.directory && info.directory) s.directory = info.directory;
+    if (s.parentID) {
+      const r = this.root(s);
+      if (r !== s) r.ledger.onSubagentInfo(s.id, { agent: s.agent, title: s.title, status: s.status });
+    }
     s.streamer?.setTitle(s.title);
   }
 
@@ -622,6 +658,13 @@ export class Orchestrator {
   private dropSession(id: string) {
     const s = this.sessions.get(id);
     if (!s) return;
+    if (s.answerFinishTimer) clearTimeout(s.answerFinishTimer);
+    s.answerFinishTimer = undefined;
+    this.stopProgressTimer(s);
+    if (s.parentID) {
+      const r = this.root(s);
+      if (r !== s) r.ledger.onSubagentRemoved(s.id);
+    }
     s.beats.dispose();
     s.streamer?.dispose();
     this.clearPending(s);
@@ -649,6 +692,8 @@ export class Orchestrator {
     const prev = s.status;
     s.status = status.type;
     const r = this.root(s);
+    r.ledger.onStatus(s.id, s === r, status);
+    if (s !== r) r.ledger.onSubagentInfo(s.id, { agent: s.agent, title: s.title, status: status.type });
     if (status.type === "retry") {
       if (r.live && !r.retryAnnounced) {
         r.retryAnnounced = true;
@@ -658,11 +703,13 @@ export class Orchestrator {
     }
     if (status.type === "busy") {
       r.retryAnnounced = false;
+      if (s === r && r.live) this.syncProgressTimer(r);
       if (r.live && r.phase !== "speaking" && r.phase !== "waiting_user") this.setPhase(r, "thinking");
       return;
     }
     // idle
     if (s === r) {
+      this.stopProgressTimer(r);
       s.beats.flush("phase");
       if (s.answer) this.finishAnswer(s);
       if (r.live && !r.pending) this.setPhase(r, "listening");
@@ -689,14 +736,25 @@ export class Orchestrator {
     s.partTypes.set(part.id, part.type);
     if (isToolPart(part)) {
       const r = this.root(s);
+      const via = s !== r ? s.agent ?? "sous-agent" : undefined;
+      r.ledger.onTool(part as ToolPart, s.id, via);
       if (part.state.status === "completed" && part.state.output) {
         this.recordFinding(r, part.tool, part.state.output);
       }
       if (!r.live) return;
-      const via = s !== r ? s.agent ?? "sous-agent" : undefined;
-      // A tool result arriving means the agent stopped talking for now.
-      if (r.answer && !r.answer.suppressed) {
-        // keep the answer stream open; tools between paragraphs are common
+      if (part.state.status === "running" && s === r && r.answer) {
+        if (r.answerFinishTimer) {
+          clearTimeout(r.answerFinishTimer);
+          r.answerFinishTimer = undefined;
+        }
+        const preToolNote = r.answer.fullText.trim();
+        if (r.answer.suppressed && preToolNote.length >= 30) {
+          const added = r.ledger.onChatNote(preToolNote);
+          r.answer = undefined;
+          if (added && preToolNote.length >= 40 && !r.pending) {
+            void this.askProgress(r, "chat_note", preToolNote);
+          }
+        }
       }
       r.beats.add(part as ToolPart, via);
       r.lastBeatAt = Date.now();
@@ -710,7 +768,11 @@ export class Orchestrator {
       }
       if ((part as { synthetic?: boolean }).synthetic || (part as { ignored?: boolean }).ignored) return;
       const r = this.root(s);
-      if (s !== r || !r.live) return;
+      if (s !== r) {
+        r.ledger.onSubagentText(s.id, part.text);
+        return;
+      }
+      if (!r.live) return;
       if (r.finishedAnswers.has(part.messageID)) return;
       // Reconcile: feed whatever we have not fed yet (covers missed deltas).
       const stream = this.answerFor(r, part.messageID);
@@ -761,6 +823,10 @@ export class Orchestrator {
   }
 
   private feedAnswer(s: Session, stream: AnswerStream, partID: string, delta: string) {
+    if (s.answerFinishTimer) {
+      clearTimeout(s.answerFinishTimer);
+      s.answerFinishTimer = undefined;
+    }
     stream.fed.set(partID, (stream.fed.get(partID) ?? 0) + delta.length);
     stream.fullText += delta;
     const trimmed = stream.fullText.trim();
@@ -774,7 +840,22 @@ export class Orchestrator {
     this.enqueueSpeech(s, "answer", sentence, 0, { streamId: stream.streamId, streamSeq: stream.seq++, streamEnd: end });
   }
 
+  private scheduleBoundaryAnswerFinish(s: Session, messageID: string) {
+    if (s.answerFinishTimer) clearTimeout(s.answerFinishTimer);
+    s.answerFinishTimer = setTimeout(() => {
+      s.answerFinishTimer = undefined;
+      if (s.answer?.messageID === messageID && !s.ledger.runningTools.size) {
+        this.finishAnswer(s);
+      }
+    }, 220);
+    s.answerFinishTimer.unref?.();
+  }
+
   private finishAnswer(s: Session) {
+    if (s.answerFinishTimer) {
+      clearTimeout(s.answerFinishTimer);
+      s.answerFinishTimer = undefined;
+    }
     const stream = s.answer;
     if (!stream) return;
     s.answer = undefined;
@@ -812,6 +893,7 @@ export class Orchestrator {
     if (!trimmed || trimmed === s.userPrompt) return;
     s.userPrompt = trimmed;
     s.userPromptAt = Date.now();
+    s.ledger.setTask(trimmed, s.userPromptAt);
     s.beats.flush("phase");
     if (s.answer) this.finishAnswer(s);
     s.clarify = undefined;
@@ -821,7 +903,7 @@ export class Orchestrator {
     void s.streamer.seed(`[TYPED]\n${excerpt(trimmed, 1200)}`).catch(() => undefined);
   }
 
-  // ---- beats ---------------------------------------------------------------
+  // ---- beats & live progress -----------------------------------------------
 
   private onBeat(beat: Beat) {
     void this.handleBeat(beat);
@@ -831,18 +913,78 @@ export class Orchestrator {
     const s = this.sessions.get(beat.sessionID);
     if (!s || !s.live || !s.streamer) return;
     if (s.pending) return; // the user is being asked something; activity can wait
-    const prompt = renderBeat(beat, {
+    const triagePrompt = renderBeat(beat, {
       userPrompt: s.userPrompt,
       sessionTitle: s.title,
       todo: s.todo,
       elapsedSinceStartMs: s.userPromptAt ? Date.now() - s.userPromptAt : undefined,
     });
     if (this.decision?.isReady && beat.tools.length <= 2) {
-      const worthSpeaking = await this.decision.triageBeat(prompt);
+      const worthSpeaking = await this.decision.triageBeat(triagePrompt);
       if (!worthSpeaking || !s.live || s.pending) return;
     }
     const expiresAt = Date.now() + this.cfg.beats.ttlMs;
-    const res = await this.askStreamer(s, "beat", prompt, this.cfg.streamer.beatTimeoutMs, "beat", expiresAt);
+    const promptBuilder = () => {
+      const base = renderBeat(beat, {
+        userPrompt: s.userPrompt,
+        sessionTitle: s.title,
+        todo: s.todo,
+        elapsedSinceStartMs: s.userPromptAt ? Date.now() - s.userPromptAt : undefined,
+      });
+      const liveState = s.ledger.renderLiveState({
+        screenText: s.lastAnswer,
+        todo: s.todo,
+        pendingSummary: s.pending ? this.pendingSummary(s.pending) : undefined,
+        screenLimit: 800,
+      });
+      return `${base}\n\n${liveState}`;
+    };
+    const res = await this.askStreamer(s, "beat", promptBuilder, this.cfg.streamer.beatTimeoutMs, "beat", expiresAt);
+    if (!res) return;
+    this.applyDecisions(s, res.decisions, { spoke: res.spoke, source: "beat", expiresAt });
+  }
+
+  private syncProgressTimer(s: Session) {
+    const intervalMs = this.cfg.beats.progressIntervalMs;
+    if (!intervalMs || intervalMs <= 0 || s.progressTimer) return;
+    s.progressTimer = setInterval(() => {
+      if (!s.live || s.status !== "busy") {
+        this.stopProgressTimer(s);
+        return;
+      }
+      if (s.pending || s.inflightSpeech || s.streamer?.busy) return;
+      const now = Date.now();
+      const refAt = Math.max(s.ledger.lastSpokenAt, s.ledger.busySince);
+      if (!refAt || now - refAt < intervalMs) return;
+      if (!s.ledger.hasActiveWork()) return;
+      s.ledger.markSpoken(now);
+      void this.askProgress(s, "periodic_checkin");
+    }, Math.max(2000, Math.min(4000, Math.floor(intervalMs / 3))));
+    s.progressTimer.unref?.();
+  }
+
+  private stopProgressTimer(s: Session) {
+    if (s.progressTimer) clearInterval(s.progressTimer);
+    s.progressTimer = undefined;
+  }
+
+  private async askProgress(s: Session, trigger: "periodic_checkin" | "chat_note", note?: string) {
+    if (!s.live || !s.streamer || s.pending) return;
+    const expiresAt = Date.now() + this.cfg.beats.ttlMs;
+    const promptBuilder = () => {
+      const lines = ["[PROGRESS]", `trigger: ${trigger}`];
+      if (note) lines.push(`note: ${excerpt(note, 600)}`);
+      lines.push(
+        s.ledger.renderLiveState({
+          screenText: s.lastAnswer,
+          todo: s.todo,
+          pendingSummary: s.pending ? this.pendingSummary(s.pending) : undefined,
+          screenLimit: 900,
+        }),
+      );
+      return lines.join("\n");
+    };
+    const res = await this.askStreamer(s, "beat", promptBuilder, this.cfg.streamer.beatTimeoutMs, "beat", expiresAt);
     if (!res) return;
     this.applyDecisions(s, res.decisions, { spoke: res.spoke, source: "beat", expiresAt });
   }
@@ -929,7 +1071,7 @@ export class Orchestrator {
   private async askStreamer(
     s: Session,
     kind: "beat" | "voice" | "blocked" | "digest",
-    prompt: string,
+    prompt: string | (() => string),
     timeoutMs: number,
     speechKind: SpeechKind,
     expiresAt = 0,
@@ -1040,6 +1182,10 @@ export class Orchestrator {
           break;
         }
         case "inject":
+          if (ctx.source !== "voice") {
+            this.log.warn("ignoring inject from non-voice source", { source: ctx.source, sessionID: s.id });
+            break;
+          }
           label(`inject:${d.mode}`, 3);
           this.scheduleInject(s, d.text, d.mode);
           break;
@@ -1100,6 +1246,7 @@ export class Orchestrator {
     else s.lastSpoken = (s.lastSpoken ? s.lastSpoken + " " : "") + clean;
     if (kind === "reply" && stream?.streamId) s.activeReplyStreamId = stream.streamId;
     const now = Date.now();
+    s.ledger.markSpoken(now);
     s.recentSpoken.push({ text: clean, at: now });
     while (s.recentSpoken.length > 12 || (s.recentSpoken.length > 0 && now - s.recentSpoken[0].at > 25000)) {
       s.recentSpoken.shift();
@@ -1232,6 +1379,14 @@ export class Orchestrator {
       lines.push("candidates:");
       for (const c of candidates) lines.push(`- "${c.heard}" -> ${c.term}`);
     }
+    lines.push(
+      s.ledger.renderLiveState({
+        screenText: screenAnswer,
+        todo: s.todo,
+        pendingSummary: s.pending ? this.pendingSummary(s.pending) : undefined,
+        screenLimit: triage === "answer_from_context" ? 3200 : 1400,
+      }),
+    );
     const res = await this.askStreamer(s, "voice", lines.join("\n"), this.cfg.streamer.voiceTimeoutMs, "reply");
     if (!res) {
       // The streamer is unreachable: the safest useful thing is to queue the raw text.
@@ -1296,12 +1451,15 @@ export class Orchestrator {
     this.clearInject(s);
     const id = `inj_${randomUUID().slice(0, 8)}`;
     const delay = this.cfg.streamer.injectDelayMs;
+    const now = Date.now();
     const timer = setTimeout(() => {
       s.pendingInject = undefined;
+      s.ledger.setPendingInject(undefined);
       void this.executeInject(s, id, text, mode);
     }, delay);
     s.pendingInject = { id, text, mode, timer };
-    this.out.toSession(s.id, { type: "inject_pending", sessionID: s.id, injectId: id, text, mode, executeAt: Date.now() + delay });
+    s.ledger.setPendingInject({ text, mode, at: now });
+    this.out.toSession(s.id, { type: "inject_pending", sessionID: s.id, injectId: id, text, mode, executeAt: now + delay });
   }
 
   cancelInject(sessionID: string, injectId: string): boolean {
@@ -1315,6 +1473,7 @@ export class Orchestrator {
   private clearInject(s: Session) {
     if (s.pendingInject) clearTimeout(s.pendingInject.timer);
     s.pendingInject = undefined;
+    s.ledger.setPendingInject(undefined);
   }
 
   private async executeInject(s: Session, id: string, text: string, mode: "queue" | "interrupt") {
@@ -1328,6 +1487,7 @@ export class Orchestrator {
         await this.client.abort(s.id, s.directory);
         await this.waitForIdle(s, 4000);
       }
+      s.ledger.setTask(text);
       s.injectedTexts.push(text);
       if (s.injectedTexts.length > 20) s.injectedTexts.shift();
       await this.client.promptAsync(s.id, s.directory, {
@@ -1360,11 +1520,14 @@ export class Orchestrator {
   private async answerPermission(s: Session, answer: "once" | "always" | "reject") {
     const p = s.pending;
     if (p?.kind !== "permission") {
-      void this.askSystem(s, "no_pending_permission");
+      if (Date.now() - (s.lastPermissionRepliedAt ?? 0) > 3000) {
+        void this.askSystem(s, "no_pending_permission");
+      }
       return;
     }
     try {
       await this.client.respondPermission(s.id, s.directory, p.req.id, answer);
+      s.lastPermissionRepliedAt = Date.now();
       this.clearPending(s);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1376,7 +1539,9 @@ export class Orchestrator {
   private async answerQuestion(s: Session, answers: string[][]) {
     const p = s.pending;
     if (p?.kind !== "question") {
-      void this.askSystem(s, "no_pending_question");
+      if (Date.now() - (s.lastQuestionRepliedAt ?? 0) > 3000) {
+        void this.askSystem(s, "no_pending_question");
+      }
       return;
     }
     try {
@@ -1386,6 +1551,7 @@ export class Orchestrator {
         return given.map((a) => q.options.find((o) => o.label.toLowerCase() === a.toLowerCase())?.label ?? a);
       });
       await this.client.replyQuestion(s.directory, p.req.id, mapped, s.id);
+      s.lastQuestionRepliedAt = Date.now();
       this.clearPending(s);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

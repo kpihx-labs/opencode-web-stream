@@ -265,6 +265,7 @@ export class OpencodeClient {
             (m) =>
               m.info.role === "assistant" &&
               !seenIds.has(m.info.id) &&
+              !m.parts.some((p) => (p as { synthetic?: boolean }).synthetic) &&
               m.info.time.created >= promptCreatedAt &&
               m.info.time.completed &&
               textOf(m.parts).length > 0,
@@ -278,6 +279,7 @@ export class OpencodeClient {
               (m) =>
                 m.info.role === "assistant" &&
                 !seenIds.has(m.info.id) &&
+                !m.parts.some((p) => (p as { synthetic?: boolean }).synthetic) &&
                 m.info.time.created >= promptCreatedAt &&
                 m.info.time.completed,
             );
@@ -285,9 +287,19 @@ export class OpencodeClient {
         }
         await sleep(60, opts.signal);
       }
+      if (opts.signal?.aborted) {
+        throw opts.signal.reason ?? new Error("opencode prompt aborted");
+      }
       const fallback = (await this.messages(sessionID, directory, 4).catch(() => []))
         .reverse()
-        .find((m) => m.info.role === "assistant" && !seenIds.has(m.info.id) && m.info.time.created >= promptCreatedAt && m.parts.length > 0);
+        .find(
+          (m) =>
+            m.info.role === "assistant" &&
+            !seenIds.has(m.info.id) &&
+            !m.parts.some((p) => (p as { synthetic?: boolean }).synthetic) &&
+            m.info.time.created >= promptCreatedAt &&
+            m.parts.length > 0,
+        );
       if (!fallback) throw new Error("opencode prompt timed out waiting for assistant reply");
       return fallback;
     }
@@ -501,12 +513,12 @@ export class OpencodeClient {
       case "session.agent.selected":
       case "session.model.selected":
       case "session.moved": {
-        const info = normalizeV2Session({ ...data, id: data.sessionID, time: { created, updated: created } }, directory);
+        const info = normalizeV2Session({ ...data, id: data.sessionID ?? data.id, time: { created, updated: created } }, directory);
         emit(obj.type === "session.created" ? "session.created" : "session.updated", { info });
         break;
       }
       case "session.deleted": {
-        const info = normalizeV2Session({ ...data, id: data.sessionID }, directory);
+        const info = normalizeV2Session({ ...data, id: data.sessionID ?? data.id }, directory);
         emit("session.deleted", { info });
         break;
       }
@@ -601,6 +613,9 @@ export class OpencodeClient {
           this.v2TextSeen.set(key, text.length);
           emit("message.part.delta", { sessionID, messageID, partID, field: "text", delta });
         }
+        emit("message.updated", {
+          info: { id: messageID, sessionID, role: "assistant", time: { created, completed: created } },
+        });
         break;
       }
       case "session.message.content.updated": {
@@ -639,19 +654,22 @@ export class OpencodeClient {
         const messageID = String(data.assistantMessageID ?? "");
         const callID = String(data.id ?? "");
         const status: ToolStatus = obj.type === "session.tool.called" ? "running" : obj.type === "session.tool.success" ? "completed" : "error";
+        const output = extractV2ToolContent(data.content);
         emit("message.part.updated", {
           part: {
             id: `${messageID}:${callID}`,
             sessionID,
             messageID,
             type: "tool",
-            tool: String((data.native as { name?: string })?.name ?? data.tool ?? "tool"),
+            tool: String((data.native as { name?: string })?.name ?? data.tool ?? data.name ?? "tool"),
             callID,
             state: {
               status,
+              title: typeof data.title === "string" ? data.title : undefined,
               input: (data.input as Record<string, unknown>) ?? undefined,
-              output: Array.isArray(data.content) ? JSON.stringify(data.content) : undefined,
-              error: data.error ? JSON.stringify(data.error) : undefined,
+              output,
+              error: data.error ? (typeof data.error === "string" ? data.error : JSON.stringify(data.error)) : undefined,
+              time: status === "running" ? { start: created } : { end: created },
             },
           },
         });
@@ -725,7 +743,7 @@ function normalizeV2Session(raw: Record<string, unknown>, fallbackDir: string): 
     id: String(raw.id ?? raw.sessionID ?? ""),
     title: String(raw.title ?? ""),
     directory: String(loc.directory ?? raw.directory ?? fallbackDir ?? ""),
-    parentID: typeof raw.parentID === "string" ? raw.parentID : undefined,
+    parentID: typeof raw.parentID === "string" ? raw.parentID : typeof raw.parentSessionID === "string" ? raw.parentSessionID : undefined,
     agent: typeof raw.agent === "string" ? raw.agent : undefined,
     model,
     version: String(raw.version ?? "2"),
@@ -734,6 +752,18 @@ function normalizeV2Session(raw: Record<string, unknown>, fallbackDir: string): 
       updated: typeof time.updated === "number" ? time.updated : Date.now(),
     },
   };
+}
+
+function extractV2ToolContent(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const texts: string[] = [];
+  for (const item of content) {
+    if (item && typeof item === "object" && typeof (item as { text?: unknown }).text === "string") {
+      texts.push((item as { text: string }).text);
+    }
+  }
+  return texts.length > 0 ? texts.join("\n") : JSON.stringify(content);
 }
 
 function normalizeV2Tool(item: Record<string, unknown>, sessionID: string, messageID: string, idx: number): Part {
@@ -758,7 +788,10 @@ function normalizeV2Tool(item: Record<string, unknown>, sessionID: string, messa
 
 function normalizeV2Message(raw: Record<string, unknown>, sessionID: string): WithParts {
   const id = String(raw.id ?? "");
-  const role: "user" | "assistant" = raw.type === "user" || raw.role === "user" ? "user" : "assistant";
+  const rawKind = String(raw.type ?? raw.role ?? "").toLowerCase();
+  const isAssistant = rawKind === "assistant";
+  const isSynthetic = rawKind === "synthetic" || rawKind === "idle" || rawKind === "model-switched";
+  const role: "user" | "assistant" = isAssistant ? "assistant" : "user";
   const time = (raw.time ?? {}) as Record<string, unknown>;
   const rawModel = (raw.model ?? {}) as { providerID?: unknown; modelID?: unknown; id?: unknown };
   const model =
@@ -767,7 +800,7 @@ function normalizeV2Message(raw: Record<string, unknown>, sessionID: string): Wi
       : undefined;
   const parts: Part[] = [];
   if (typeof raw.text === "string") {
-    parts.push({ id: `${id}:text`, sessionID, messageID: id, type: "text", text: raw.text });
+    parts.push({ id: `${id}:text`, sessionID, messageID: id, type: "text", text: raw.text, ...(isSynthetic ? { synthetic: true } : {}) });
   }
   if (Array.isArray(raw.content)) {
     const textChunks: string[] = [];
@@ -779,7 +812,7 @@ function normalizeV2Message(raw: Record<string, unknown>, sessionID: string): Wi
       }
     });
     if (textChunks.length > 0) {
-      parts.push({ id: `${id}:text`, sessionID, messageID: id, type: "text", text: textChunks.join("\n") });
+      parts.push({ id: `${id}:text`, sessionID, messageID: id, type: "text", text: textChunks.join("\n"), ...(isSynthetic ? { synthetic: true } : {}) });
     }
   }
   return {
