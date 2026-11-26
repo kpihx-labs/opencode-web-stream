@@ -407,17 +407,25 @@ class CockpitApp {
     this.mic?.setDucked(false);
     this.ui.update({ state: "interrupted" });
     this.link.send({ type: "barge_in", sessionID: this.sessionID, spokenOver: heard });
-    // If no words follow, this was a cough or a side remark: pick up where we stopped.
+    // If no words follow, pick up where we stopped — but NEVER resume while user is still speaking or Hex is transcribing.
+    this.scheduleFalseBargeResume(FALSE_BARGE_IN_MS);
+  }
+
+  private scheduleFalseBargeResume(delayMs: number) {
     if (this.falseBargeTimer) window.clearTimeout(this.falseBargeTimer);
     this.falseBargeTimer = window.setTimeout(() => {
       this.falseBargeTimer = undefined;
       if (this.interruptedAt === 0) return;
+      if (this.mic?.isSpeaking || this.pendingTranscripts.size > 0) {
+        this.scheduleFalseBargeResume(650);
+        return;
+      }
       log.debug("false barge-in, resuming");
       this.interruptedAt = 0;
       this.link.send({ type: "barge_in_false", sessionID: this.sessionID });
       this.player.resume();
       this.ui.update({ state: "speaking" });
-    }, FALSE_BARGE_IN_MS);
+    }, delayMs);
   }
 
   private consumeBargeIn(): { bargeIn: boolean; spokenOver?: string } {
@@ -448,7 +456,7 @@ class CockpitApp {
       if (!result.text || result.decision === "echo" || result.decision === "quiet") {
         log.debug("stt utterance did not interrupt", { text: result.text?.slice(0, 60), decision: result.decision });
         if (!result.text) this.ui.showInterim("");
-        if (bargeIn) this.player.resume();
+        if (bargeIn && !this.mic?.isSpeaking && this.pendingTranscripts.size <= 1) this.player.resume();
       }
     } catch (err) {
       if (!controller.signal.aborted) {

@@ -95,6 +95,8 @@ export type Session = {
   lastBeatAt: number;
   recentFindings: string[];
   recentSpoken: Array<{ text: string; at: number }>;
+  activeAnswerStreamId?: string;
+  activeReplyStreamId?: string;
 };
 
 export class Orchestrator {
@@ -753,6 +755,7 @@ export class Orchestrator {
       spokenSentences: 0,
       suppressed: s.prefs.digest,
     };
+    s.activeAnswerStreamId = s.answer.streamId;
     return s.answer;
   }
 
@@ -1060,11 +1063,16 @@ export class Orchestrator {
       const corrected = decisions.find((d) => d.kind === "inject") as Extract<Decision, { kind: "inject" }> | undefined;
       s.lastHeard = { raw: ctx.transcript, corrected: corrected?.text ?? ctx.transcript };
       this.out.toSession(s.id, { type: "heard", sessionID: s.id, raw: ctx.transcript, corrected: corrected?.text ?? ctx.transcript, decision: decisionLabel });
-      if (ctx.bargeIn) {
-        // Barge-in that led nowhere: let the cockpit continue what it was saying.
-        const quiet = decisions.every((d) => d.kind === "quiet" || d.kind === "learn");
-        if (quiet) this.out.toSession(s.id, { type: "resume", sessionID: s.id });
-        else this.out.toSession(s.id, { type: "cancel", sessionID: s.id });
+      const quiet = decisions.every((d) => d.kind === "quiet" || d.kind === "learn");
+      if (quiet) {
+        if (ctx.bargeIn) this.out.toSession(s.id, { type: "resume", sessionID: s.id });
+      } else {
+        // Real non-quiet turn: cancel any leftover answer/reply chunks so stale audio never resumes after this response.
+        if (s.activeAnswerStreamId) {
+          this.out.toSession(s.id, { type: "cancel", sessionID: s.id, streamId: s.activeAnswerStreamId });
+          s.activeAnswerStreamId = undefined;
+        }
+        if (ctx.bargeIn) this.out.toSession(s.id, { type: "cancel", sessionID: s.id });
       }
     }
   }
@@ -1088,6 +1096,7 @@ export class Orchestrator {
     };
     if (kind !== "answer" || !stream || stream.streamSeq === 0) s.lastSpoken = clean;
     else s.lastSpoken = (s.lastSpoken ? s.lastSpoken + " " : "") + clean;
+    if (kind === "reply" && stream?.streamId) s.activeReplyStreamId = stream.streamId;
     const now = Date.now();
     s.recentSpoken.push({ text: clean, at: now });
     while (s.recentSpoken.length > 12 || (s.recentSpoken.length > 0 && now - s.recentSpoken[0].at > 25000)) {
@@ -1155,8 +1164,14 @@ export class Orchestrator {
       s.answer.suppressed = true;
       this.out.toSession(s.id, { type: "cancel", sessionID: s.id, streamId: s.answer.streamId });
     }
+    if (s.activeReplyStreamId) {
+      this.out.toSession(s.id, { type: "cancel", sessionID: s.id, streamId: s.activeReplyStreamId });
+      s.activeReplyStreamId = undefined;
+    }
     this.setPhase(s, "thinking");
     this.setLanguage(s, opts.lang);
+    // Emit preliminary heard row IMMEDIATELY so the UI records user speech chronologically BEFORE any streamed reply!
+    this.out.toSession(s.id, { type: "heard", sessionID: s.id, raw, corrected: raw, decision: "…" });
     const screenAnswer = (s.answer?.fullText.trim() || s.lastAnswer).trim();
     const hasScreenData = screenAnswer.length > 80 || s.recentFindings.length > 0;
     let triage: "stop" | "noise" | "answer_from_context" | "pass" = "pass";

@@ -141,3 +141,32 @@ test("late message.part.updated after session.idle does not double-speak an alre
   await new Promise((r) => setTimeout(r, 120));
   assert.equal(h.spoken().length, 1);
 });
+
+test("preliminary heard arrives before reply speech and activeAnswerStreamId is cancelled after idle", async (t) => {
+  const h = await setup();
+  t.after(() => h.cleanup());
+  const session = h.opencode.addSession({ id: "ses_chrono", directory: DIRECTORY });
+  h.send({ type: "attach", sessionID: session.id, directory: DIRECTORY, protocol: 5, visible: true });
+  h.send({ type: "live", sessionID: session.id, enabled: true, directory: DIRECTORY });
+  await until(() => h.opencode.prompts.some((p) => p.body.noReply), { label: "seeded" });
+
+  // Stream an answer and finish to idle.
+  const msgId = "msg_ans_fin";
+  const partId = `${msgId}:text`;
+  h.opencode.emit(DIRECTORY, "session.status", { sessionID: session.id, status: { type: "busy" } });
+  h.opencode.emit(DIRECTORY, "message.updated", { info: { id: msgId, sessionID: session.id, role: "assistant", time: { created: Date.now() } } });
+  h.opencode.emit(DIRECTORY, "message.part.updated", { part: { id: partId, sessionID: session.id, messageID: msgId, type: "text", text: "Première phrase de l'agent. Deuxième phrase longue." } });
+  h.opencode.emit(DIRECTORY, "session.status", { sessionID: session.id, status: { type: "idle" } });
+  await until(() => h.spoken().length >= 2, { label: "answer spoken" });
+
+  const startIdx = h.msgs.length;
+  h.opencode.replyWith("<reply>Voici la priorité unique.</reply>");
+  h.send({ type: "transcript", sessionID: session.id, text: "Quelle est la priorité unique ?", bargeIn: false, directory: DIRECTORY });
+  await until(() => h.msgs.slice(startIdx).some((m) => m.type === "heard" && m.decision === "reply"), { label: "final heard" });
+
+  const slice = h.msgs.slice(startIdx);
+  const prelimIdx = slice.findIndex((m) => m.type === "heard" && m.decision === "…");
+  const speakIdx = slice.findIndex((m) => m.type === "speak");
+  assert.ok(prelimIdx >= 0 && speakIdx > prelimIdx, "heard must appear chronologically before reply speech");
+  assert.ok(slice.some((m) => m.type === "cancel" && String(m.streamId || "").startsWith(`ans_${msgId}`)), "finished answer streamId must be cancelled on follow-up reply");
+});

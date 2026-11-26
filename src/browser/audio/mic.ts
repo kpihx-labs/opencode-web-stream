@@ -122,6 +122,7 @@ export class Microphone {
   private useWorkletPcm = false;
   private ducked = false;
   private duckedUntil = 0;
+  private loopbackEstablished = false;
   private startedDuringPlayback = false;
   private running = false;
   private readonly opts: Required<Omit<MicOptions, "referenceStream">>;
@@ -132,15 +133,15 @@ export class Microphone {
   ) {
     this.opts = {
       confirmMs: opts.confirmMs ?? 220,
-      duckedConfirmMs: opts.duckedConfirmMs ?? 450,
+      duckedConfirmMs: opts.duckedConfirmMs ?? 220,
       hangoverMs: opts.hangoverMs ?? 550,
       prerollMs: opts.prerollMs ?? 400,
       minUtteranceMs: opts.minUtteranceMs ?? 380,
       maxUtteranceMs: opts.maxUtteranceMs ?? 0,
       marginDb: opts.marginDb ?? 13,
       holdMarginDb: opts.holdMarginDb ?? 8,
-      duckedMarginDb: opts.duckedMarginDb ?? 26,
-      duckedHoldMarginDb: opts.duckedHoldMarginDb ?? 15,
+      duckedMarginDb: opts.duckedMarginDb ?? 15,
+      duckedHoldMarginDb: opts.duckedHoldMarginDb ?? 9,
     };
     this.referenceStream = opts.referenceStream;
   }
@@ -151,18 +152,22 @@ export class Microphone {
     return this.running;
   }
 
+  get isSpeaking(): boolean {
+    return this.speaking;
+  }
+
   setReferenceStream(stream: MediaStream | undefined) {
     this.referenceStream = stream;
   }
 
-  /** Raise the bar while the agent speaks (+900ms tail) so speaker echo never self-triggers. */
+  /** Raise the bar slightly while the agent speaks (+450ms tail) without deafening barge-in. */
   setDucked(ducked: boolean) {
     if (ducked) {
       this.ducked = true;
-      this.duckedUntil = Date.now() + 900;
+      this.duckedUntil = Date.now() + 450;
     } else {
       this.ducked = false;
-      this.duckedUntil = Date.now() + 900;
+      this.duckedUntil = Date.now() + 450;
     }
   }
 
@@ -175,6 +180,7 @@ export class Microphone {
     try {
       // The loopback must exist before capture so the canceller knows the reference.
       const loopbackOk = await this.setupLoopback();
+      this.loopbackEstablished = loopbackOk;
       this.events.onLoopback?.(loopbackOk);
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -339,12 +345,14 @@ export class Microphone {
     if (this.energies.length > FLOOR_WINDOW) this.energies.shift();
     const floor = noiseFloor(this.energies);
     const duckedNow = this.isDucked;
+    const duckMargin = this.loopbackEstablished ? this.opts.duckedMarginDb : Math.max(this.opts.duckedMarginDb, 22);
+    const duckHold = this.loopbackEstablished ? this.opts.duckedHoldMarginDb : Math.max(this.opts.duckedHoldMarginDb, 13);
     const margin = this.speaking
-      ? (duckedNow ? this.opts.duckedHoldMarginDb : this.opts.holdMarginDb)
-      : (duckedNow ? this.opts.duckedMarginDb : this.opts.marginDb);
+      ? (duckedNow ? duckHold : this.opts.holdMarginDb)
+      : (duckedNow ? duckMargin : this.opts.marginDb);
     const isVoice = db > floor + margin;
     const now = Date.now();
-    const confirmNeeded = duckedNow ? this.opts.duckedConfirmMs : this.opts.confirmMs;
+    const confirmNeeded = duckedNow ? (this.loopbackEstablished ? this.opts.duckedConfirmMs : 340) : this.opts.confirmMs;
 
     if (isVoice) {
       this.lastVoiceAt = now;
