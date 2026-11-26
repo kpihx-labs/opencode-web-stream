@@ -271,8 +271,9 @@ export class OpencodeClient {
       }
       const fallback = (await this.messages(sessionID, directory, 4).catch(() => []))
         .reverse()
-        .find((m) => m.info.role === "assistant" && !seenIds.has(m.info.id) && m.info.time.created >= promptCreatedAt);
-      return fallback ?? { info: { id: "", sessionID, role: "assistant", time: { created: Date.now() } }, parts: [] };
+        .find((m) => m.info.role === "assistant" && !seenIds.has(m.info.id) && m.info.time.created >= promptCreatedAt && m.parts.length > 0);
+      if (!fallback) throw new Error("opencode prompt timed out waiting for assistant reply");
+      return fallback;
     }
 
     return this.request<WithParts>("POST", `/session/${encodeURIComponent(sessionID)}/message`, {

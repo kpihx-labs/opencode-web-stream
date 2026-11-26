@@ -398,12 +398,12 @@ export class Orchestrator {
     const lines = ["[CONTEXT]", `date: ${new Date().toISOString().slice(0, 16).replace("T", " ")}`, `session: ${s.title || s.id}`, `directory: ${s.directory}`];
     lines.push(`main agent you embody: ${s.agent || "Colab"}`);
     lines.push(`session is ${s.status}`);
-    if (s.userPrompt) lines.push(`latest prompt from user: ${excerpt(s.userPrompt, 600)}`);
-    if (s.lastAnswer) lines.push(`latest answer on screen:\n${s.lastAnswer.slice(0, 4000)}`);
-    if (s.recentFindings.length) lines.push(`recent tool findings:\n${s.recentFindings.join("\n").slice(0, 2000)}`);
+    if (s.userPrompt) lines.push(`latest prompt from user: ${excerpt(s.userPrompt, 400)}`);
+    if (s.lastAnswer) lines.push(`latest answer (summary):\n${s.lastAnswer.slice(0, 1400)}`);
+    if (s.recentFindings.length) lines.push(`recent tool findings:\n${s.recentFindings.slice(-2).join("\n").slice(0, 800)}`);
     lines.push(`answer reading mode: ${s.prefs.digest ? "digest" : "full"}`);
     lines.push(`languages: ${this.cfg.speech.languages.join(", ")} (default ${this.cfg.speech.default}); user last spoke ${s.lang}`);
-    lines.push(renderLexiconContext(lexicon, this.registry.aliases(), this.cfg.lexicon.contextTerms));
+    lines.push(renderLexiconContext(lexicon, this.registry.aliases(), Math.min(80, this.cfg.lexicon.contextTerms)));
     return lines.join("\n");
   }
 
@@ -1183,8 +1183,13 @@ export class Orchestrator {
     }
     if (s.clarify) lines.push(`you asked for clarification: "${excerpt(s.clarify.question, 200)}" about: "${excerpt(s.clarify.transcript, 200)}"`);
     if (s.userPrompt) lines.push(`current task: ${excerpt(s.userPrompt, 300)}`);
-    if (screenAnswer) lines.push(`current answer on screen:\n${screenAnswer.slice(0, 6000)}`);
-    if (s.recentFindings.length) lines.push(`recent tool findings:\n${s.recentFindings.join("\n").slice(0, 2500)}`);
+    if (screenAnswer) {
+      const answerLimit = triage === "answer_from_context" ? 3200 : 1200;
+      lines.push(`current answer on screen:\n${screenAnswer.slice(0, answerLimit)}`);
+    }
+    if (s.recentFindings.length && triage === "answer_from_context") {
+      lines.push(`recent tool findings:\n${s.recentFindings.slice(-2).join("\n").slice(0, 1200)}`);
+    }
     if (s.todo) lines.push(`plan: ${excerpt(s.todo, 300)}`);
     if (triage === "answer_from_context" && hasScreenData) {
       lines.push(
