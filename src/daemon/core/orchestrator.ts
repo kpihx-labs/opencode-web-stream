@@ -119,10 +119,13 @@ export class Orchestrator {
   /** Directories where a cockpit armed live before any session existed. */
   private readonly pendingLive = new Set<string>();
   /** Draft UI agent/model selection per directory before a new session materializes. */
-  private readonly pendingMetaByDir = new Map<string, { agent?: string; model?: { providerID: string; modelID: string } }>();
+  private readonly pendingMetaByDir = new Map<string, { agent?: string; model?: { providerID: string; modelID: string }; modelLabel?: string }>();
   /** Cached agent descriptions from OpenCode `/api/agent`. */
   private readonly agentDescriptions = new Map<string, string>();
   private agentsLoaded = false;
+  /** Cached provider + model catalog for deterministic label -> {providerID, modelID} resolution. */
+  private readonly modelLabelIndex = new Map<string, { providerID: string; modelID: string }>();
+  private modelsLoadedAt = 0;
 
   constructor(
     private readonly cfg: Config,
@@ -210,15 +213,19 @@ export class Orchestrator {
   }
 
   /** Pre-build lexicon and hydrate session metadata on cockpit attach for zero-delay startup. */
-  prewarm(sessionID: string, directory?: string, meta?: { agent?: string; model?: { providerID: string; modelID: string } }) {
+  prewarm(sessionID: string, directory?: string, meta?: { agent?: string; model?: { providerID: string; modelID: string }; modelLabel?: string }) {
     if (directory) {
       void this.lexiconFor(directory);
       void this.ensureAgentDescriptions(directory);
     }
     if (!sessionID) {
-      if (directory && (meta?.agent || meta?.model)) {
+      if (directory && (meta?.agent || meta?.model || meta?.modelLabel)) {
         const cur = this.pendingMetaByDir.get(directory) ?? {};
-        this.pendingMetaByDir.set(directory, { agent: meta.agent ?? cur.agent, model: meta.model ?? cur.model });
+        this.pendingMetaByDir.set(directory, {
+          agent: meta.agent ?? cur.agent,
+          model: meta.model ?? cur.model,
+          modelLabel: meta.modelLabel ?? cur.modelLabel,
+        });
       }
       return;
     }
@@ -226,7 +233,7 @@ export class Orchestrator {
     const s = this.sessions.get(sessionID) ?? (directory ? this.ensureSession(sessionID, directory) : undefined);
     if (s) {
       if (!s.title && !s.lastAnswer) void this.hydrate(s);
-      if (meta?.agent || meta?.model) void this.syncClientMeta(s, meta);
+      if (meta?.agent || meta?.model || meta?.modelLabel) void this.syncClientMeta(s, meta);
     }
   }
 
@@ -263,7 +270,7 @@ export class Orchestrator {
     enabled: boolean,
     directoryHint?: string,
     lang?: string,
-    meta?: { agent?: string; model?: { providerID: string; modelID: string } },
+    meta?: { agent?: string; model?: { providerID: string; modelID: string }; modelLabel?: string },
   ): Promise<SessionSnapshot | undefined> {
     // The new-session page has no session yet. Live is armed against the
     // directory; the session itself is created the moment the user speaks.
@@ -274,9 +281,13 @@ export class Orchestrator {
       }
       if (enabled) {
         this.pendingLive.add(directoryHint);
-        if (meta?.agent || meta?.model) {
+        if (meta?.agent || meta?.model || meta?.modelLabel) {
           const cur = this.pendingMetaByDir.get(directoryHint) ?? {};
-          this.pendingMetaByDir.set(directoryHint, { agent: meta.agent ?? cur.agent, model: meta.model ?? cur.model });
+          this.pendingMetaByDir.set(directoryHint, {
+            agent: meta.agent ?? cur.agent,
+            model: meta.model ?? cur.model,
+            modelLabel: meta.modelLabel ?? cur.modelLabel,
+          });
         }
         void this.lexiconFor(directoryHint);
         void this.ensureAgentDescriptions(directoryHint);
@@ -297,7 +308,7 @@ export class Orchestrator {
       s = this.ensureSession(sessionID, directory);
     }
     if (enabled === s.live) {
-      if (enabled && (meta?.agent || meta?.model)) void this.syncClientMeta(s, meta);
+      if (enabled && (meta?.agent || meta?.model || meta?.modelLabel)) void this.syncClientMeta(s, meta, { pushToServer: true });
       return this.snapshot(sessionID);
     }
     s.live = enabled;
@@ -308,7 +319,7 @@ export class Orchestrator {
         s.live = false;
         return undefined;
       }
-      if (meta?.agent || meta?.model) {
+      if (meta?.agent || meta?.model || meta?.modelLabel) {
         await this.syncClientMeta(s, meta, { pushToServer: true });
       }
       this.setPhase(s, s.status === "busy" ? "thinking" : "listening");
@@ -1402,6 +1413,7 @@ export class Orchestrator {
       directory?: string;
       agent?: string;
       model?: { providerID: string; modelID: string };
+      modelLabel?: string;
     },
   ): Promise<string> {
     const raw = text.trim();
@@ -1409,15 +1421,15 @@ export class Orchestrator {
     // No session yet: create one now, and move the cockpit onto it, so what
     // follows lands in a conversation the user can actually see.
     if (!sessionID) {
-      const created = await this.materialize(opts.directory, { agent: opts.agent, model: opts.model });
+      const created = await this.materialize(opts.directory, { agent: opts.agent, model: opts.model, modelLabel: opts.modelLabel });
       if (!created) return "no-session";
       sessionID = created;
     }
     const s = this.sessions.get(sessionID) ?? this.ensureSession(sessionID, opts.directory ?? "");
     if (!s.live) {
-      await this.setLive(sessionID, true, opts.directory, opts.lang, { agent: opts.agent, model: opts.model });
-    } else if (opts.agent || opts.model) {
-      await this.syncClientMeta(s, { agent: opts.agent, model: opts.model }, { pushToServer: true });
+      await this.setLive(sessionID, true, opts.directory, opts.lang, { agent: opts.agent, model: opts.model, modelLabel: opts.modelLabel });
+    } else if (opts.agent || opts.model || opts.modelLabel) {
+      await this.syncClientMeta(s, { agent: opts.agent, model: opts.model, modelLabel: opts.modelLabel }, { pushToServer: true });
     }
     if (!s.streamer) {
       await this.startStreamer(s);
@@ -1529,7 +1541,7 @@ export class Orchestrator {
    */
   private async materialize(
     directory: string | undefined,
-    meta?: { agent?: string; model?: { providerID: string; modelID: string } },
+    meta?: { agent?: string; model?: { providerID: string; modelID: string }; modelLabel?: string },
   ): Promise<string | undefined> {
     const dir = directory || [...this.pendingLive][0];
     if (!dir) {
@@ -1539,10 +1551,11 @@ export class Orchestrator {
     const pendingMeta = this.pendingMetaByDir.get(dir);
     this.pendingMetaByDir.delete(dir);
     const agent = meta?.agent || pendingMeta?.agent;
-    const model = meta?.model || pendingMeta?.model;
+    const label = meta?.modelLabel || pendingMeta?.modelLabel;
+    const model = meta?.model || pendingMeta?.model || (label ? await this.resolveModelLabel(label, dir) : undefined);
     try {
       const created = await this.client.createSession(dir, {
-        ...(agent && agent !== "build" ? { agent } : {}),
+        ...(agent ? { agent } : {}),
         ...(model?.providerID && model?.modelID ? { model } : {}),
       });
       this.pendingLive.delete(dir);
@@ -1742,6 +1755,7 @@ export class Orchestrator {
       lang?: string;
       agent?: string;
       model?: { providerID: string; modelID: string };
+      modelLabel?: string;
     },
   ) {
     if (!sessionID) return;
@@ -1751,14 +1765,42 @@ export class Orchestrator {
     if (prefs.muted !== undefined) s.prefs.muted = prefs.muted;
     if (prefs.lang !== undefined) this.setLanguage(s, prefs.lang);
     this.registry.setPrefs(sessionID, { digest: prefs.digest, muted: prefs.muted });
-    if (prefs.agent || prefs.model) {
-      void this.syncClientMeta(s, { agent: prefs.agent, model: prefs.model }, { pushToServer: true });
+    if (prefs.agent || prefs.model || prefs.modelLabel) {
+      void this.syncClientMeta(s, { agent: prefs.agent, model: prefs.model, modelLabel: prefs.modelLabel }, { pushToServer: true });
     }
+  }
+
+  private async resolveModelLabel(label: string, directory?: string): Promise<{ providerID: string; modelID: string } | undefined> {
+    const norm = label.trim().toLowerCase().replace(/\s+/g, " ");
+    if (!norm) return undefined;
+    const now = Date.now();
+    if (this.modelLabelIndex.size === 0 || now - this.modelsLoadedAt > 60_000) {
+      try {
+        const [providers, models] = await Promise.all([this.client.listProviders(directory), this.client.listModels(directory)]);
+        const provNameById = new Map(providers.map((p) => [p.id, p.name]));
+        this.modelLabelIndex.clear();
+        for (const m of models) {
+          if (!m.providerID || !m.id) continue;
+          const ref = { providerID: m.providerID, modelID: m.id };
+          const provName = provNameById.get(m.providerID) ?? m.providerID;
+          this.modelLabelIndex.set(`${provName} / ${m.name}`.toLowerCase().replace(/\s+/g, " "), ref);
+          this.modelLabelIndex.set(`${m.providerID} / ${m.name}`.toLowerCase().replace(/\s+/g, " "), ref);
+          this.modelLabelIndex.set(`${m.providerID}/${m.id}`.toLowerCase(), ref);
+          if (!this.modelLabelIndex.has(m.name.toLowerCase().replace(/\s+/g, " "))) {
+            this.modelLabelIndex.set(m.name.toLowerCase().replace(/\s+/g, " "), ref);
+          }
+        }
+        this.modelsLoadedAt = now;
+      } catch {
+        // leave existing cache intact
+      }
+    }
+    return this.modelLabelIndex.get(norm);
   }
 
   private async syncClientMeta(
     s: Session,
-    meta: { agent?: string; model?: { providerID: string; modelID: string } },
+    meta: { agent?: string; model?: { providerID: string; modelID: string }; modelLabel?: string },
     opts: { pushToServer?: boolean } = {},
   ) {
     const prevAgent = s.agent;
@@ -1766,14 +1808,21 @@ export class Orchestrator {
     let agentChanged = false;
     let modelChanged = false;
 
-    if (meta.agent && meta.agent !== "build" && meta.agent !== s.agent) {
+    const resolvedModel =
+      meta.model?.providerID && meta.model?.modelID
+        ? meta.model
+        : meta.modelLabel
+          ? await this.resolveModelLabel(meta.modelLabel, s.directory)
+          : undefined;
+
+    if (meta.agent && meta.agent !== s.agent) {
       s.agent = meta.agent;
       agentChanged = true;
     }
-    if (meta.model?.providerID && meta.model?.modelID) {
-      const nextKey = `${meta.model.providerID}/${meta.model.modelID}`;
+    if (resolvedModel?.providerID && resolvedModel?.modelID) {
+      const nextKey = `${resolvedModel.providerID}/${resolvedModel.modelID}`;
       if (nextKey !== prevModelKey) {
-        s.model = { providerID: meta.model.providerID, modelID: meta.model.modelID };
+        s.model = { providerID: resolvedModel.providerID, modelID: resolvedModel.modelID };
         modelChanged = true;
       }
     }
@@ -1782,7 +1831,7 @@ export class Orchestrator {
       const modelKey = s.model?.providerID ? `${s.model.providerID}/${s.model.modelID}` : undefined;
       s.ledger.setMeta({ agent: s.agent, modelKey, directory: s.directory });
     }
-    if (opts.pushToServer && s.status === "idle") {
+    if (opts.pushToServer) {
       if (agentChanged && s.agent) {
         await this.client.setSessionAgent(s.id, s.directory, s.agent).catch(() => undefined);
       }

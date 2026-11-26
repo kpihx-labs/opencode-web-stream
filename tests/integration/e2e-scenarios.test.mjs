@@ -318,3 +318,20 @@ test("hydrate keeps current session agent instead of reverting to old message hi
   const movedSeed = h.opencode.prompts.filter((p) => p.body.noReply).at(-1)?.body.parts?.[0]?.text ?? "";
   assert.match(movedSeed, /directory: \/tmp\/other-project/);
 });
+
+test("switching to build agent syncs both main session and streamer instead of falling back to Colab", async (t) => {
+  const h = await setup();
+  t.after(() => h.cleanup());
+  const session = h.opencode.addSession({ id: "ses_build", directory: DIRECTORY, agent: "Colab" });
+  h.send({ type: "attach", sessionID: session.id, directory: DIRECTORY, protocol: 5, visible: true });
+  h.send({ type: "live", sessionID: session.id, enabled: true, directory: DIRECTORY });
+  await until(() => h.opencode.prompts.some((p) => p.body.noReply), { label: "seeded" });
+
+  const prevSeeds = h.opencode.prompts.filter((p) => p.body.noReply).length;
+  h.send({ type: "prefs", sessionID: session.id, agent: "build", model: { providerID: "opencode-go", modelID: "hy4-flash-free" } });
+  await until(() => h.opencode.prompts.filter((p) => p.body.noReply).length > prevSeeds, { label: "reseed with build" });
+
+  const latestSeed = h.opencode.prompts.filter((p) => p.body.noReply).at(-1)?.body.parts?.[0]?.text ?? "";
+  assert.match(latestSeed, /main agent you embody: build/, "build must be honored and embodied, never overwritten by Colab");
+  assert.match(latestSeed, /active model: opencode-go\/hy4-flash-free/);
+});

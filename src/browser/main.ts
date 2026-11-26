@@ -69,6 +69,7 @@ class CockpitApp {
   private languages: string[] = ["fr", "en"];
   private voicePluginSelect?: HTMLSelectElement;
   private lastMetaKey = "";
+  private metaSyncTimer?: number;
   private destroyed = false;
 
   constructor() {
@@ -144,6 +145,7 @@ class CockpitApp {
     this.link.open();
     void this.refreshStatus();
     this.watchVoicePluginSelector();
+    this.watchComposerMeta();
     window.addEventListener("storage", (event) => {
       if (event.key === VOICE_PLUGIN_LANG_KEY || event.key === V2_VOICE_LANG_KEY || event.key === LANG_KEY) {
         this.setLanguage(resolveLanguagePreference(), false);
@@ -181,16 +183,42 @@ class CockpitApp {
     }
   }
 
-  private currentUiMeta(): { agent?: string; model?: { providerID: string; modelID: string } } {
+  private currentUiMeta(): { agent?: string; model?: { providerID: string; modelID: string }; modelLabel?: string } {
     return resolveUiMeta(this.sessionID, this.directory);
+  }
+
+  private scheduleMetaSync(delayMs = 75) {
+    if (this.metaSyncTimer) window.clearTimeout(this.metaSyncTimer);
+    this.metaSyncTimer = window.setTimeout(() => {
+      this.metaSyncTimer = undefined;
+      this.syncMeta();
+    }, delayMs);
+  }
+
+  private watchComposerMeta() {
+    const onUiActivity = () => this.scheduleMetaSync(75);
+    document.addEventListener("click", onUiActivity, { capture: true });
+    document.addEventListener("keyup", onUiActivity, { capture: true });
+    const observer = new MutationObserver((records) => {
+      for (const rec of records) {
+        const target = rec.target as Node | null;
+        const el = target instanceof Element ? target : target?.parentElement;
+        if (!el || el.closest("[data-opencode-stream]")) continue;
+        if (el.closest('form, [data-slot="composer-actions"], button[aria-label="Choose agent"], button[data-action="composer-model"]')) {
+          this.scheduleMetaSync(75);
+          break;
+        }
+      }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
   }
 
   private syncMeta(force = false) {
     const meta = this.currentUiMeta();
-    const key = `${this.sessionID}|${meta.agent ?? ""}|${meta.model?.providerID ?? ""}/${meta.model?.modelID ?? ""}`;
+    const key = `${this.sessionID}|${meta.agent ?? ""}|${meta.model?.providerID ?? ""}/${meta.model?.modelID ?? ""}|${meta.modelLabel ?? ""}`;
     if (!force && key === this.lastMetaKey) return;
     this.lastMetaKey = key;
-    if (!meta.agent && !meta.model) return;
+    if (!meta.agent && !meta.model && !meta.modelLabel) return;
     if (this.sessionID) {
       this.link.send({ type: "prefs", sessionID: this.sessionID, ...meta });
     } else {
@@ -846,16 +874,36 @@ function decodeBase64(value: string): string {
 }
 
 /**
- * Read the live agent and model currently selected in OpenCode Web V2's UI
- * (`workspace:model-selection` store + visible composer agent button) so even
- * pre-prompt or new-session selections synchronize immediately to the daemon.
+ * Read the live agent and model currently selected in OpenCode Web V2's UI.
+ *
+ * OpenCode Web V2 keeps uncommitted changes on an existing session in
+ * `localStorage` (`workspace:model-selection`) AND renders the active agent
+ * and model labels in the composer buttons (`button[aria-label="Choose agent"]`
+ * and `button[data-action="composer-model"]`) even on `/new-session` where
+ * `workspace:model-selection` has not been written yet.
  */
 export function resolveUiMeta(
   sessionID: string,
   directory: string,
-): { agent?: string; model?: { providerID: string; modelID: string } } {
+): { agent?: string; model?: { providerID: string; modelID: string }; modelLabel?: string } {
   let agent: string | undefined;
   let model: { providerID: string; modelID: string } | undefined;
+  let modelLabel: string | undefined;
+  let domAgent: string | undefined;
+
+  try {
+    if (typeof document !== "undefined") {
+      domAgent =
+        document.querySelector<HTMLElement>('button[aria-label="Choose agent"]')?.textContent?.trim() ||
+        document.querySelector<HTMLElement>('[data-component="prompt-agent-control"]')?.textContent?.trim() ||
+        undefined;
+      const domModel = document.querySelector<HTMLElement>('button[data-action="composer-model"]')?.textContent?.trim();
+      if (domModel) modelLabel = domModel;
+    }
+  } catch {
+    // ignore DOM access issues in unit tests
+  }
+
   try {
     const dirSlug = directory ? directory.replace(/[^a-zA-Z0-9]+/g, "-") : "";
     const keys: string[] = [];
@@ -863,7 +911,6 @@ export function resolveUiMeta(
       const k = localStorage.key(i);
       if (k && k.endsWith(":workspace:model-selection")) keys.push(k);
     }
-    // Prefer the workspace store matching the current directory slug.
     keys.sort((a, b) => Number(Boolean(dirSlug && b.includes(dirSlug))) - Number(Boolean(dirSlug && a.includes(dirSlug))));
     for (const k of keys) {
       const raw = localStorage.getItem(k);
@@ -883,7 +930,8 @@ export function resolveUiMeta(
       const entry = (sessionID && sessions[sessionID]) || (!sessionID && (sessions.new || sessions.default)) || undefined;
       if (!entry) continue;
       if (typeof entry.agent === "string" && entry.agent.trim()) agent = entry.agent.trim();
-      const chosen = (agent && entry.choices?.[agent]) || entry.choice;
+      const activeAgent = agent || domAgent;
+      const chosen = entry.choice?.providerID && entry.choice?.modelID ? entry.choice : activeAgent ? entry.choices?.[activeAgent] : undefined;
       if (chosen?.providerID && chosen?.modelID) {
         model = { providerID: chosen.providerID, modelID: chosen.modelID };
       }
@@ -892,15 +940,13 @@ export function resolveUiMeta(
   } catch {
     // ignore storage parse failures
   }
-  try {
-    if (typeof document !== "undefined") {
-      const domAgent = document.querySelector<HTMLElement>('[data-component="prompt-agent-control"]')?.textContent?.trim();
-      if (domAgent && (!agent || agent === "build")) agent = domAgent;
-    }
-  } catch {
-    // ignore DOM access issues in unit tests
-  }
-  return { ...(agent ? { agent } : {}), ...(model ? { model } : {}) };
+
+  if (!agent && domAgent) agent = domAgent;
+  return {
+    ...(agent ? { agent } : {}),
+    ...(model ? { model } : {}),
+    ...(modelLabel ? { modelLabel } : {}),
+  };
 }
 
 function readFlag(key: string, fallback: boolean): boolean {

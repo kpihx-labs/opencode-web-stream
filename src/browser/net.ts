@@ -163,7 +163,7 @@ export class DaemonLink {
     sessionID: string,
     directory: string | undefined,
     visible: boolean,
-    meta?: { agent?: string; model?: { providerID: string; modelID: string } },
+    meta?: { agent?: string; model?: { providerID: string; modelID: string }; modelLabel?: string },
   ) {
     this.send({
       type: "attach",
@@ -173,6 +173,7 @@ export class DaemonLink {
       visible,
       ...(meta?.agent ? { agent: meta.agent } : {}),
       ...(meta?.model ? { model: meta.model } : {}),
+      ...(meta?.modelLabel ? { modelLabel: meta.modelLabel } : {}),
     });
   }
 
@@ -198,6 +199,7 @@ export async function postAudio(
     apply?: boolean;
     agent?: string;
     model?: { providerID: string; modelID: string };
+    modelLabel?: string;
   },
   signal?: AbortSignal,
 ): Promise<{ text: string; decision?: string }> {
@@ -210,6 +212,7 @@ export async function postAudio(
   if (params.apply === false) query.set("apply", "0");
   if (params.agent) query.set("agent", params.agent);
   if (params.model?.providerID && params.model?.modelID) query.set("model", `${params.model.providerID}/${params.model.modelID}`);
+  else if (params.modelLabel) query.set("modelLabel", params.modelLabel);
   const res = await fetch(DaemonLink.apiUrl(`/api/stt?${query}`), {
     method: "POST",
     headers: { "content-type": blob.type || "audio/webm" },

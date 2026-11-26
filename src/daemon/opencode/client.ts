@@ -19,6 +19,8 @@ import type { ScopedLogger } from "../log.js";
 export type WithParts = { info: MessageInfo; parts: Part[] };
 export type Project = { id: string; worktree: string; name?: string };
 export type AgentInfo = { id: string; name: string; description?: string };
+export type ProviderInfo = { id: string; name: string };
+export type CatalogModelInfo = { id: string; name: string; providerID: string };
 export type FetchLike = typeof fetch;
 export type ApiMode = "auto" | "v1" | "v2";
 
@@ -185,6 +187,25 @@ export class OpencodeClient {
       id: String(a.id ?? a.name ?? ""),
       name: String(a.name ?? a.id ?? ""),
       description: typeof a.description === "string" ? a.description : undefined,
+    }));
+  }
+
+  async listProviders(directory?: string): Promise<ProviderInfo[]> {
+    if ((await this.resolveMode()) !== "v2") return [];
+    const raw = await this.request<{ data?: Array<Record<string, unknown>> }>("GET", "/api/provider", { directory });
+    return (Array.isArray(raw?.data) ? raw.data : []).map((p) => ({
+      id: String(p.id ?? ""),
+      name: String(p.name ?? p.id ?? ""),
+    }));
+  }
+
+  async listModels(directory?: string): Promise<CatalogModelInfo[]> {
+    if ((await this.resolveMode()) !== "v2") return [];
+    const raw = await this.request<{ data?: Array<Record<string, unknown>> }>("GET", "/api/model", { directory });
+    return (Array.isArray(raw?.data) ? raw.data : []).map((m) => ({
+      id: String(m.id ?? m.modelID ?? ""),
+      name: String(m.name ?? m.id ?? ""),
+      providerID: String(m.providerID ?? ""),
     }));
   }
 

@@ -165,19 +165,15 @@ test("pause/resume guards against deadlocks and duplicate je dis rows", () => {
   assert.match(bundle, /onUtteranceDiscarded/);
 });
 
-test("resolveUiMeta reads OpenCode Web V2 workspace:model-selection for active session and new-session draft", () => {
+test("resolveUiMeta reads OpenCode Web V2 workspace:model-selection and DOM composer buttons including build on /new-session", () => {
   const resolveUiMeta = extract("resolveUiMeta");
   const key = "opencode.workspace.-var-tmp.19albml.dat:workspace:model-selection";
   const val = JSON.stringify({
     session: {
       ses_x1: {
-        agent: "Explore",
-        choice: { providerID: "nvidia", modelID: "m-default" },
-        choices: { Explore: { providerID: "opencode-go", modelID: "hy4-flash-free" } },
-      },
-      new: {
-        agent: "Pure",
-        choice: { providerID: "opencode-go", modelID: "fast-pure" },
+        agent: "build",
+        choice: { providerID: "opencode-go", modelID: "hy4-flash-free" },
+        choices: { Colab: { providerID: "nvidia", modelID: "nvidia/nemotron-3-ultra-550b-a55b" } },
       },
     },
   });
@@ -186,16 +182,26 @@ test("resolveUiMeta reads OpenCode Web V2 workspace:model-selection for active s
     key: (i) => (i === 0 ? key : null),
     getItem: (k) => (k === key ? val : null),
   };
+  globalThis.document = {
+    querySelector(sel) {
+      if (sel === 'button[aria-label="Choose agent"]') return { textContent: "build" };
+      if (sel === 'button[data-action="composer-model"]') return { textContent: "OpenCode Go / Hy4 flash Free" };
+      return null;
+    },
+  };
   try {
     assert.deepEqual(resolveUiMeta("ses_x1", "/var/tmp"), {
-      agent: "Explore",
+      agent: "build",
       model: { providerID: "opencode-go", modelID: "hy4-flash-free" },
+      modelLabel: "OpenCode Go / Hy4 flash Free",
     });
+    // On /new-session, workspace:model-selection has no entry; DOM buttons supply agent + modelLabel!
     assert.deepEqual(resolveUiMeta("", "/var/tmp"), {
-      agent: "Pure",
-      model: { providerID: "opencode-go", modelID: "fast-pure" },
+      agent: "build",
+      modelLabel: "OpenCode Go / Hy4 flash Free",
     });
   } finally {
     delete globalThis.localStorage;
+    delete globalThis.document;
   }
 });

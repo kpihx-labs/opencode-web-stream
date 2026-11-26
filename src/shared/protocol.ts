@@ -127,10 +127,10 @@ export type ControlAction =
 
 export type ClientMessage =
   /** Cockpit announces itself and the session it is looking at. */
-  | { type: "attach"; sessionID: string; directory?: string; protocol: number; visible: boolean; agent?: string; model?: { providerID: string; modelID: string } }
+  | { type: "attach"; sessionID: string; directory?: string; protocol: number; visible: boolean; agent?: string; model?: { providerID: string; modelID: string }; modelLabel?: string }
   | { type: "detach"; sessionID: string }
   /** Live mode toggled from the cockpit button. `sessionID` is empty on the new-session page. */
-  | { type: "live"; sessionID: string; enabled: boolean; directory?: string; lang?: string; agent?: string; model?: { providerID: string; modelID: string } }
+  | { type: "live"; sessionID: string; enabled: boolean; directory?: string; lang?: string; agent?: string; model?: { providerID: string; modelID: string }; modelLabel?: string }
   /** A final transcript. `spokenOver` is what the user heard before cutting in. */
   | {
       type: "transcript";
@@ -143,6 +143,7 @@ export type ClientMessage =
       directory?: string;
       agent?: string;
       model?: { providerID: string; modelID: string };
+      modelLabel?: string;
     }
   /** The user started speaking while we were talking: stop audio now. */
   | { type: "barge_in"; sessionID: string; spokenOver?: string }
@@ -151,7 +152,7 @@ export type ClientMessage =
   /** The cockpit finished (or gave up on) an utterance. */
   | { type: "spoken"; sessionID: string; utteranceId: string; completed: boolean; heardText?: string }
   /** Cockpit-local preference and meta changes worth syncing server-side. */
-  | { type: "prefs"; sessionID: string; digest?: boolean; muted?: boolean; lang?: string; agent?: string; model?: { providerID: string; modelID: string } }
+  | { type: "prefs"; sessionID: string; digest?: boolean; muted?: boolean; lang?: string; agent?: string; model?: { providerID: string; modelID: string }; modelLabel?: string }
   /** Direct control from a cockpit button rather than from voice. */
   | { type: "control"; sessionID: string; action: ControlAction }
   | { type: "visible"; sessionID: string; visible: boolean }
